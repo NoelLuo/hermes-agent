@@ -313,6 +313,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         metadata: Optional[dict[str, Any]] = None, event_message_id: Optional[str] = None,
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         session_key: Optional[str] = None, inbound_message_id: Optional[str] = None,
+        inbound_event: Optional[MessageEvent] = None,
     ) -> bool:
         """Deliver a queued response using the normal text+attachment split.
 
@@ -327,6 +328,11 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         must leave the normal completion send as the fallback, or the user gets nothing. A connector
         DECLINE returns True: that destination is not approved and must not be re-sent."""
         from gateway.run import _strip_response_attachments_for_direct_send
+        from gateway.run_adapter_turns import deliver_adapter_final
+        handled = await deliver_adapter_final(adapter, response, inbound_event, session_key, metadata,
+            text_already_delivered=text_already_delivered, deliver_media=deliver_media)
+        if handled is not None:
+            return handled
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:

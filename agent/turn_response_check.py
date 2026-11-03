@@ -282,10 +282,13 @@ def retry_invalid_response(
             return _verdict("continue")
     retry_count += 1
 
-    # Eager fallback: empty/malformed responses often mean rate limiting.
-    if agent._fallback_index < len(agent._fallback_chain):
+    # Forward this response's evidence, including HTTP-200 Codex quota failures.
+    from agent.fallback_policy import activate_for_error, fallback_allowed
+    from agent.turn_recovery import _codex_soft_failure_error
+    _quota_error = _codex_soft_failure_error(response) if _soft is not None else None
+    if fallback_allowed(_quota_error) and agent._fallback_index < len(agent._fallback_chain):
         agent._buffer_diagnostic_status("⚠️ Empty/malformed response — switching to fallback...")
-    if agent._try_activate_fallback():
+    if activate_for_error(agent, _quota_error):
         active_system_prompt = _arm_fallback_restart(
             agent, api_messages, active_system_prompt, _retry)
         retry_count = 0
@@ -301,9 +304,9 @@ def retry_invalid_response(
     agent._buffer_vprint(f"   ⏱️  {_failure_hint}")
 
     if retry_count >= max_retries:
-        if agent._has_pending_fallback():
+        if fallback_allowed(_quota_error) and agent._has_pending_fallback():
             agent._buffer_diagnostic_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
-        if agent._try_activate_fallback():
+        if activate_for_error(agent, _quota_error):
             active_system_prompt = _arm_fallback_restart(
                 agent, api_messages, active_system_prompt, _retry)
             retry_count = 0

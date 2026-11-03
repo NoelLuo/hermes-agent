@@ -3902,6 +3902,8 @@ class BasePlatformAdapter(ABC):
         """Dispatch a reset-like bypass command (/stop, /new, /reset): keep a guard installed while
         the runner handles it (follow-ups stay queued), cancel the old task AFTER the response,
         drain once."""
+        if await self._reject_role_command(event, cmd):
+            return
         logger.debug("[%s] Command '/%s' bypassing active-session guard for %s", self.name, cmd, session_key)
         current_guard = self._active_sessions.get(session_key)
         command_guard = asyncio.Event()
@@ -3920,6 +3922,15 @@ class BasePlatformAdapter(ABC):
                     self._release_session_guard(session_key, guard=command_guard)
             raise
         await self._drain_pending_after_session_command(session_key, command_guard)
+
+    async def _reject_role_command(self, event, command=None) -> bool:
+        from gateway.request_security import policy_for_adapter
+        policy = policy_for_adapter(self, event.source)
+        command = command or event.get_command()
+        if policy is not None and command and not policy.allows_command(command):
+            await self.send(event.source.chat_id, "此操作仅限管理员。", reply_to=event.message_id)
+            return True
+        return False
 
     async def handle_message(self, event: MessageEvent) -> None:
         """Process an incoming message; returns quickly by spawning a background
@@ -3943,6 +3954,10 @@ class BasePlatformAdapter(ABC):
         # Identity FIRST: every key below (routing check, guard lookup, batch lane) derives from it.
         if self._drop_unresolved(event):
             return
+        if await self._reject_role_command(event):
+            return
+        from gateway.request_security import grant_inbound_media, policy_for_adapter
+        grant_inbound_media(policy_for_adapter(self, event.source), event.media_urls)
         expected_session_key = str((event.metadata or {}).get("gateway_session_key") or "").strip()
         # Explicitly routed events already name their destination; recovering a
         # different topic would redirect them and yield before the session claim.
@@ -3990,7 +4005,14 @@ class BasePlatformAdapter(ABC):
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass
         commands / clarify replies dispatch inline, everything else is queued."""
+        if await self._reject_role_command(event):
+            return
         # The shared runtime's durable FIFO replaces the adapter's busy-message slot.
+        from gateway.request_security import policy_for_adapter
+        policy = policy_for_adapter(self, event.source)
+        if policy is not None and not policy.is_admin and not event.get_command():
+            await self.send(event.source.chat_id, "正在处理其他请求，请稍后重试。", reply_to=event.message_id)
+            return
         if self._shared_runtime_owns_input(event):
             from gateway.session_ingress_burst import dispatch_busy_burst
             await dispatch_busy_burst(self, event, session_key)  # main's photo/text burst merge
@@ -4210,6 +4232,27 @@ class BasePlatformAdapter(ABC):
         except Exception:
             logger.debug("delivery ledger update failed", exc_info=True)
 
+    def _request_media_allowed(self, source, path: str) -> bool:
+        """Model-authored local files require a request-local artifact receipt."""
+        from gateway.request_security import policy_for_adapter
+        from urllib.parse import unquote, urlparse
+        policy = policy_for_adapter(self, source)
+        if policy is None:
+            return True
+        if policy.is_admin:
+            # Admin rights do not turn a changed export into the recorded snapshot.
+            return policy._exports.unchanged(path)
+        parsed = urlparse(str(path))
+        if parsed.scheme.lower() in {"http", "https"}:
+            return policy.allows_media(path)
+        if parsed.scheme.lower() == "file":
+            if parsed.netloc:
+                return False
+            path = unquote(parsed.path)
+            if re.match(r"^/[A-Za-z]:/", path):
+                path = path[1:]
+        return policy.allows_media(path)
+
     async def _deliver_media_attachments(
         self, event: MessageEvent, media_files: list, local_files: list, *,
         force_document_attachments: bool, human_delay: float, metadata: dict[str, Any],
@@ -4218,7 +4261,8 @@ class BasePlatformAdapter(ABC):
         ``send_multiple_images`` unless ``[[as_document]]``; otherwise audio → send_voice (MEDIA
         tags only, never bare local files), video → send_video, else send_document. Every failure is
         reported. Each send feeds ``record_delivery`` so media-only turns report SUCCESS."""
-        from urllib.parse import quote as _quote
+        media_files = [(p, v) for p, v in media_files if self._request_media_allowed(event.source, p)]
+        local_files = [p for p in local_files if self._request_media_allowed(event.source, p)]
 
         def _as_image(path: str) -> bool:
             return Path(path).suffix.lower() in _IMAGE_EXTS and not force_document_attachments
@@ -4226,13 +4270,15 @@ class BasePlatformAdapter(ABC):
         _image_paths += [p for p in local_files if _as_image(p)]
         if _image_paths:
             await self._send_image_batch(
-                event, [(f"file://{_quote(p)}", "") for p in _image_paths], metadata, human_delay,
+                event, [(Path(p).absolute().as_uri(), "") for p in _image_paths], metadata, human_delay,
                 record_delivery)
         chat_id = event.source.chat_id
 
         async def _send_one(path: str, *, is_voice: bool, media_tag: bool) -> SendResult:
             """MEDIA tags may route to send_voice (bare files never); an adapter's own failure notice is not repeated."""
             ext = Path(path).suffix.lower()
+            if not self._request_media_allowed(event.source, path):
+                return SendResult(success=False, error="Request policy denied local attachment")
             if media_tag and should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
                 result = await self.send_voice(chat_id=chat_id, audio_path=path, metadata=metadata, is_voice=is_voice)
             elif ext in _VIDEO_EXTS:
@@ -4255,7 +4301,10 @@ class BasePlatformAdapter(ABC):
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
             try:
-                record_delivery(await _send_one(path, is_voice=is_voice, media_tag=media_tag))
+                from agent.request_security import policy_scope
+                from gateway.request_security import policy_for_adapter
+                with policy_scope(policy_for_adapter(self, event.source)):
+                    record_delivery(await _send_one(path, is_voice=is_voice, media_tag=media_tag))
             except Exception as err:
                 record_delivery(SendResult(success=False, error=str(err)))
                 if media_tag:
@@ -4269,9 +4318,15 @@ class BasePlatformAdapter(ABC):
         """Batch-send images; a failure is logged (never raised) so other attachments still go.
         The batch result feeds ``record_delivery`` so media-only turns report their real
         outcome instead of FAILURE."""
+        images = [(p, caption) for p, caption in images if self._request_media_allowed(event.source, p)]
+        if not images:
+            return
         try:
-            result = await self.send_multiple_images(
-                chat_id=event.source.chat_id, images=images, metadata=metadata, human_delay=human_delay)
+            from agent.request_security import policy_scope
+            from gateway.request_security import policy_for_adapter
+            with policy_scope(policy_for_adapter(self, event.source)):
+                result = await self.send_multiple_images(
+                    chat_id=event.source.chat_id, images=images, metadata=metadata, human_delay=human_delay)
         except Exception as batch_err:
             logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
             record_delivery(SendResult(success=False, error=str(batch_err)))
@@ -4351,6 +4406,13 @@ class BasePlatformAdapter(ABC):
         then fail loudly if a non-empty response produced nothing deliverable. Attachment
         results feed ``record_delivery`` so the turn outcome reflects them."""
         human_delay = self._get_human_delay()
+        attachment_results = []
+        original_record_delivery = record_delivery
+
+        def record_delivery(result):
+            attachment_results.append(result)
+            original_record_delivery(result)
+
         images, media_files, local_files = extracted.images, extracted.media_files, extracted.local_files
         if images:
             logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
@@ -4359,6 +4421,8 @@ class BasePlatformAdapter(ABC):
             event, media_files, local_files,
             force_document_attachments=extracted.force_document_attachments,
             human_delay=human_delay, metadata=metadata, record_delivery=record_delivery)
+        from gateway.guest_export_delivery import check_export_delivery
+        check_export_delivery(event, attachment_results)
         if not (anything_sent or images or local_files or media_files) and extracted.pre_extract.strip():
             logger.error("[%s] response_delivery_dropped: non-empty response "
                          "(%d chars) produced no delivered message or attachment "
@@ -4389,7 +4453,12 @@ class BasePlatformAdapter(ABC):
         # The handler's routed profile scope is gone by now; Docker MEDIA translation and the
         # bare-path validator infer the sandbox from the ACTIVE profile (#109024).
         with self._media_delivery_scope(event.source):
+            from gateway.guest_export_delivery import take_export_response
+            response, exported = take_export_response(response, event)
             media_files, response = self.extract_media(response)
+            if exported is not None:
+                media_files = [(path, False) for path in exported]
+                force_document = True  # Preserve snapshot bytes and per-file transport outcomes.
             media_files = self.filter_media_delivery_paths(media_files, session_key=session_key)
             images, text_content = self.extract_images(response)
             # Strip any remaining internal directives from message body (fixes #1561). _strip_media_directives

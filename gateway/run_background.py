@@ -82,7 +82,13 @@ class GatewayBackgroundMixin:
                 from gateway.session_context import declare_stateless_channel
                 # This finite /bg session has no route for a completion after its final reply.
                 declare_stateless_channel()
-                agent = AIAgent(
+                from agent.request_security import policy_scope
+                from gateway.request_security import policy_for_source
+                request_policy = policy_for_source(self, source)
+                def _construct(**kwargs):
+                    with policy_scope(request_policy):
+                        return AIAgent(**kwargs)
+                agent = _construct(
                     model=turn_route["model"],
                     **turn_route["runtime"],
                     **_checkpoint_agent_kwargs(user_config),

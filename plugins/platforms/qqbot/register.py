@@ -7,9 +7,11 @@ connection.
 
 from __future__ import annotations
 
+import re
+
 from gateway.platforms._shared import env_is_connected
 from gateway.platforms._shared import config_connected_extra
-from gateway.platforms.send_targets import StandaloneSendPolicy
+from gateway.platforms.send_targets import StandaloneSendPolicy, regex_stripped_parser
 
 from .adapter import QQAdapter, check_qq_requirements
 
@@ -137,6 +139,7 @@ def register(ctx) -> None:
     ctx.register_platform(
         standalone_send=StandaloneSendPolicy(label="QQ Bot", media=True, captionable=True, text_direct=True),
         name="qqbot",
+        target_ref_syntax_fn=regex_stripped_parser(re.compile(r"\s*[0-9a-fA-F]{32}\s*")),
         dashboard_description="Connect Hermes to a QQ Bot from the QQ Open Platform.",
         docs_url="https://q.qq.com",
         dashboard_env_vars=("QQ_APP_ID", "QQ_CLIENT_SECRET", "QQ_ALLOWED_USERS"),

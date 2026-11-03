@@ -104,6 +104,29 @@ def _same_chat_key_slots(
 class GatewayBusySessionMixin:
     """Busy-session queueing, slot claims, slash dispatch tables, destructive-slash confirmation."""
 
+    def _request_command_denial(self, event, command=None):
+        """Opt-in role gate, including unregistered slash commands."""
+        from gateway.request_security import policy_for_source
+        policy = policy_for_source(self, event.source)
+        command = command or event.get_command()
+        if policy is not None and command and not policy.allows_command(command):
+            return EphemeralReply("此操作仅限管理员。")
+        return None
+
+    def _request_busy_isolation(self, event, session_key):
+        """Different actors never steer or interrupt a privileged running turn."""
+        from gateway.request_security import policy_for_source
+        policy = policy_for_source(self, event.source)
+        if policy is None:
+            return None
+        if not policy.is_admin:
+            return "reject"
+        state = self._peek_session_state(session_key)
+        owner = getattr(getattr(state, "turn", None), "event", None)
+        if owner is None or str(owner.source.user_id) != str(event.source.user_id):
+            return "queue"
+        return None
+
     def _queue_during_drain_enabled(self, busy_input_mode: Optional[str] = None) -> bool:
         # "queue"/"steer" mean messages survive a restart (queued for the new process); "interrupt" drops.
         mode = busy_input_mode or self._busy_input_mode
@@ -509,7 +532,11 @@ class GatewayBusySessionMixin:
         # ``merge_text=False``, which silently OVERWROTE the single pending slot when consecutive text
         # messages arrived in ``busy_input_mode: queue``.
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
+        from gateway.request_security import policy_for_source
+        policy = policy_for_source(self, event.source)
         same_security_context = existing is not None and (
+            (policy is None or str(existing.source.user_id) == str(event.source.user_id))
+            and
             getattr(existing, "internal", False) == getattr(event, "internal", False)
             and getattr(existing, "inherit_channel_pin", False) == getattr(event, "inherit_channel_pin", False)
             and getattr(existing, "allow_gateway_control", True)
@@ -928,6 +955,10 @@ class GatewayBusySessionMixin:
             logger.debug("Failed to send busy-ack: %s", e)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        denial = self._request_command_denial(event)
+        if denial is not None:
+            await self._send_busy_reply(event, self._delivery_adapter_for(event.source), denial)
+            return True
         # Gateway wakes have no external user identity. Admit them before auth/drain/approval
         # handling, without merging their text into an already queued human message.
         if event.internal and event.allow_gateway_control:
@@ -959,6 +990,13 @@ class GatewayBusySessionMixin:
             await self._send_busy_drain_notice(event, session_key, effective_mode)
             return True
         if await self._route_plaintext_approval_while_busy(event, session_key):
+            return True
+        isolation = self._request_busy_isolation(event, session_key)
+        if isolation == "reject":
+            await self._send_busy_reply(event, self._delivery_adapter_for(event.source), "正在处理其他请求，请稍后重试。")
+            return True
+        if isolation == "queue":
+            self._queue_or_replace_pending_event(session_key, event)
             return True
         adapter = self._delivery_adapter_for(event.source)
         if not adapter:
@@ -1105,6 +1143,9 @@ class GatewayBusySessionMixin:
         1. ``busy_handler`` — special mid-run variant (e.g. /goal's control-verb whitelist, /queue's FIFO
         enqueue, /model's custom reject text). 2. 3. See #5057, #6252, #10370.
         """
+        denial = self._request_command_denial(event, cmd_def.name)
+        if denial is not None:
+            return denial
         kind, target = self._busy_slash_route(cmd_def)
         if kind == "special":
             return await getattr(self, target)(event, quick_key, source)
@@ -1221,6 +1262,9 @@ class GatewayBusySessionMixin:
         # /steer lands BETWEEN tool-call iterations of the same run (appended to the last tool
         # result) — no interrupt, no new user turn, no role-alternation violation.
         from gateway.run import _AGENT_PENDING_SENTINEL
+        isolation = self._request_busy_isolation(event, quick_key)
+        if isolation == "reject":
+            return EphemeralReply("此操作仅限管理员。")
         steer_text = event.get_command_args().strip()
         if not steer_text:
             return t("gateway.steer.usage")
@@ -1239,6 +1283,8 @@ class GatewayBusySessionMixin:
                 return None  # its commit sends the reply
             return reply
 
+        if isolation == "queue":
+            return _queue_fallback(t("gateway.steer.queued_starting"))
         if running_agent is _AGENT_PENDING_SENTINEL:
             return await _queue_fallback(t("gateway.steer.queued_starting"))
         if not running_agent or not hasattr(running_agent, "steer"):

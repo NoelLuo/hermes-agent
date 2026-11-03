@@ -320,6 +320,10 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         """Consume a reply to a pending ``/update`` prompt (routed to the detached update process via
         ``.update_response``); None when nothing was consumed. Recognized slash commands must bypass
         this or /new, /help etc. get silently consumed as update answers."""
+        from gateway.request_security import policy_for_source
+        if policy_for_source(self, event.source) is not None:
+            # Only request-bound update buttons can answer a configured QQ prompt.
+            return None
         _up_state = self._peek_session_state(_quick_key)
         if _up_state is None or not _up_state.persistent.update_prompt_pending:
             return None
@@ -478,13 +482,24 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             or self._slash_confirm_text_choices().get(_norm_reply)
         )
         if _confirm_choice is not None:
+            denial = self._request_command_denial(event, "approve")
+            if denial is not None:
+                return denial
+            from gateway.request_security import policy_for_source
+            if policy_for_source(self, event.source) is not None:
+                target = f"confirm:{_pending_confirm.get('confirm_id')}"
+                if target not in event.get_command_args().strip().split():
+                    return EphemeralReply("确认需要明确请求目标：/approve " + target)
             _resolved = await _slash_confirm_mod.resolve(
                 _quick_key, _pending_confirm.get("confirm_id"), _confirm_choice,
             )
             return _resolved or ""
         # Stale pending + unrelated command: the user moved on, so drop the pending state rather
         # than let the confirm block normal usage indefinitely.
-        _slash_confirm_mod.clear_if_stale(_quick_key)
+        from gateway.request_security import policy_for_source
+        policy = policy_for_source(self, event.source)
+        if policy is None or policy.is_admin:
+            _slash_confirm_mod.clear_if_stale(_quick_key)
         return None
 
     def _hm_evict_idle_stale_agent(self, _quick_key: str) -> None:
@@ -756,6 +771,16 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             # an internal synthetic event never interrupts or steers the running turn.
             self._queue_or_replace_pending_event(_quick_key, event)
             return None
+        denial = self._request_command_denial(event)
+        if denial is not None:
+            return denial
+        if not event.get_command():
+            isolation = self._request_busy_isolation(event, _quick_key)
+            if isolation == "reject":
+                return EphemeralReply("正在处理其他请求，请稍后重试。")
+            if isolation == "queue":
+                self._queue_or_replace_pending_event(_quick_key, event)
+                return None
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
         if not _handled:
             _handled, _result = await self._busy_skill_turn(event, source, _quick_key)
@@ -1220,6 +1245,13 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if authority is not None and not event.get_command() and not is_internal:
             from gateway.session_ingress import executing_admission
             if not executing_admission.get():
+                if self._is_session_running(_quick_key):
+                    isolation = self._request_busy_isolation(event, _quick_key)
+                    if isolation == "reject":
+                        return True, EphemeralReply("正在处理其他请求，请稍后重试。")
+                    if isolation == "queue":
+                        from gateway.session_ingress import admit_message
+                        return True, await admit_message(authority, event)
                 # A message the adapter saw as idle still waits when an earlier queued turn runs
                 # outside its session guard: the running-turn check is the busy test that counts.
                 busy = self._is_session_running(_quick_key) and not getattr(event, "_fifo_only", False)
@@ -1269,6 +1301,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if _admitted is None:
             return None
         event, source, is_internal = _admitted
+        denial = self._request_command_denial(event)
+        if denial is not None:
+            return denial
         if not is_internal:
             from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
             record_gateway_slash_command(event)
@@ -1286,6 +1321,13 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return _paused_notice
 
         _quick_key = self._session_key_for_source(source)
+        if not is_internal and not event.get_command() and self._is_session_running(_quick_key):
+            isolation = self._request_busy_isolation(event, _quick_key)
+            if isolation == "reject":
+                return EphemeralReply("正在处理其他请求，请稍后重试。")
+            if isolation == "queue":
+                self._queue_or_replace_pending_event(_quick_key, event)
+                return None
         _reply = None if is_internal else await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
             return _reply

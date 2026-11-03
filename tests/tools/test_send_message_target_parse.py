@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from gateway.config import Platform
+from gateway.run import GatewayRunner  # bootstrap before per-test real-home I/O protection
 from tools.send_message_tool import _send_to_platform, send_message_tool
 from tools.send_message_targets import _parse_target_ref
 

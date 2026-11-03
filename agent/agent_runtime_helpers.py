@@ -2476,10 +2476,37 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     """Invoke a single tool (agent-level or registry-dispatched) and return the result string;
     no display logic. Used by the concurrent path; the sequential path keeps its own inline
     invocation for display."""
+    from agent.request_security import current_policy, policy_scope
+
+    request_policy = getattr(agent, "_request_security_policy", None) or current_policy()
+    with policy_scope(request_policy):
+        return _invoke_tool_scoped(
+            agent, function_name, function_args, effective_task_id,
+            tool_call_id=tool_call_id, messages=messages,
+            pre_tool_block_checked=pre_tool_block_checked,
+            skip_tool_request_middleware=skip_tool_request_middleware,
+            tool_request_middleware_trace=tool_request_middleware_trace,
+            skip_tool_execution_middleware=skip_tool_execution_middleware,
+            request_policy=request_policy,
+        )
+
+
+def _invoke_tool_scoped(agent, function_name, function_args, effective_task_id, *,
+                        tool_call_id, messages, pre_tool_block_checked,
+                        skip_tool_request_middleware, tool_request_middleware_trace,
+                        skip_tool_execution_middleware, request_policy):
     from agent.inline_tool_executors import (
         InlineToolContext, apply_transform_tool_result, emit_terminal_post_tool_call,
         resolve_invoke_tool_executor, tool_hook_ids
     )
+    from agent.tool_executor import _grant_generated_audio
+
+    def _denied(args):
+        return request_policy is not None and not request_policy.allows_tool(function_name, args)
+
+    denial = json.dumps({"error": "Requester is not authorized to execute this tool with these arguments."})
+    if _denied(function_args):
+        return denial
     if not isinstance(function_args, dict):
         function_args = {}
     hook_ids = tool_hook_ids(agent, effective_task_id, tool_call_id)
@@ -2492,6 +2519,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             _tool_middleware_trace = _tool_request_mw.trace
     except Exception as _mw_err:
         logger.debug("tool_request middleware error: %s", _mw_err)
+    if _denied(function_args):
+        return denial
     block_message: Optional[str] = None
     if not pre_tool_block_checked:
         block_message, function_args = _pre_tool_block_message(
@@ -2514,7 +2543,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         )
 
         def _execute(next_args: dict) -> Any:
+            if _denied(next_args):
+                return denial
             result = inline_executor(agent, next_args, inline_ctx)
+            _grant_generated_audio(request_policy, function_name, result)
             call_args = next_args if isinstance(next_args, dict) else function_args
             duration_ms = int((time.monotonic() - tool_start_time) * 1000)
             emit_terminal_post_tool_call(
@@ -2528,6 +2560,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
     else:
         def _execute(next_args: dict) -> Any:
+            if _denied(next_args):
+                return denial
             dispatch_kwargs = dict(
                 tool_call_id=tool_call_id, session_id=agent.session_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
@@ -2541,7 +2575,11 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             if skip_tool_execution_middleware:
                 dispatch_kwargs["skip_tool_execution_middleware"] = True
             import model_tools
-            return model_tools.handle_function_call(function_name, next_args, effective_task_id, **dispatch_kwargs)
+            result = model_tools.handle_function_call(function_name, next_args, effective_task_id, **dispatch_kwargs)
+            _grant_generated_audio(request_policy, function_name, result)
+            return result
+    if _denied(function_args):
+        return denial
     if skip_tool_execution_middleware:
         return _execute(function_args)
     from hermes_cli.middleware import run_tool_execution_middleware

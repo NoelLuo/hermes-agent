@@ -252,6 +252,11 @@ def _agent_home(agent: Any) -> Optional[Path]:
         return None
 
 
+def _public_context(agent: Any) -> bool:
+    policy = getattr(agent, "_request_security_policy", None)
+    return policy is not None and policy.public_context
+
+
 def _agent_skills_dir(agent: Any) -> Optional[Path]:
     """The agent's own ``<home>/skills`` dir, or None to use ambient home."""
     home = _agent_home(agent)
@@ -524,6 +529,8 @@ def _memory_parts(agent: Any) -> list[str]:
     the same check ``inject_memory_provider_tools`` uses, so we never advertise
     tools the toolset config gated off)."""
     parts: list[str] = []
+    if _public_context(agent):
+        return parts
     if agent._memory_store:
         for enabled, kind in ((agent._memory_enabled, "memory"), (agent._user_profile_enabled, "user")):
             block = agent._memory_store.format_for_system_prompt(kind) if enabled else None
@@ -748,33 +755,38 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _ctx_len = _cc_len if isinstance(_cc_len, int) and _cc_len > 0 else None
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts, _soul_loaded = _identity_parts(agent, _ctx_len)
+    from agent.request_workspace_guidance import workspace_request_guidance
+    stable_parts.extend(workspace_request_guidance(agent))
     # The skill_view() pointer dangles without skill tools OR without the
     # hermes-agent skill installed, so the variant is chosen after the skills
     # index is built; this slot holds its position.
     _help_guidance_slot = len(stable_parts)
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
     stable_parts.extend(_guidance_parts(agent))
-    skills_prompt = _skills_prompt(agent)
+    skills_prompt = "" if _public_context(agent) else _skills_prompt(agent)
     # Skill-pointer variant requires BOTH skill_view AND the hermes-agent skill
     # in the rendered index (pure string check — inherits the index's stability).
     if "skill_view" in (agent.valid_tool_names or set()) and "- hermes-agent:" in skills_prompt:
         stable_parts[_help_guidance_slot] = HERMES_AGENT_HELP_GUIDANCE
     stable_parts.extend(_alibaba_identity_part(agent))
     # Pinned skills are per-agent constants (resolved once), so they live in the stable prefix.
-    stable_parts.extend(_auto_load_parts(agent))
+    if not _public_context(agent):
+        stable_parts.extend(_auto_load_parts(agent))
     # Coding posture: the operating brief stays in the stable prefix. The
     # environment block contains the current cwd/backend and belongs after
     # project context, not ahead of a large shared AGENTS.md block.
-    environment_hints = _pb.build_environment_hints()
-    coding_prefix_parts, coding_workspace_parts, coding_trailing_parts = _coding_parts(agent)
+    public_context = _public_context(agent)
+    environment_hints = "" if public_context else _pb.build_environment_hints()
+    coding_prefix_parts, coding_workspace_parts, coding_trailing_parts = ([], [], []) if public_context else _coding_parts(agent)
     stable_parts.extend(coding_prefix_parts)
-    post_workspace_parts = _post_workspace_parts(agent)
+    post_workspace_parts = [] if public_context else _post_workspace_parts(agent)
     # ── Context tier (project/worktree-dependent, may change between sessions) ──
     context_parts: list[str] = []
     # ephemeral_system_prompt is injected at API-call time only, never cached.
     if system_message is not None:
         context_parts.append(system_message)
-    context_parts.extend(_context_files_part(agent, _ctx_len, _soul_loaded))
+    if not public_context:
+        context_parts.extend(_context_files_part(agent, _ctx_len, _soul_loaded))
     if coding_workspace_parts:
         context_parts.extend([*coding_workspace_parts, *coding_trailing_parts, *post_workspace_parts])
     else:
@@ -787,10 +799,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     volatile_parts: list[str] = [skills_prompt, *_memory_parts(agent)]
     # Plugin sections are confined to one coarse anchor in the volatile tail so
     # a resumed process can reconstruct the stable prefix without re-running plugins.
-    volatile_parts.extend(_plugin_section_blocks(_frozen_plugin_prompt_sections(agent), "after_memory"))
+    if not public_context:
+        volatile_parts.extend(_plugin_section_blocks(_frozen_plugin_prompt_sections(agent), "after_memory"))
     # The profile line names this home's path, so it rides in the volatile tier: the stable
     # prefix then stays byte-identical across every profile (and home) on the host.
-    volatile_parts.append(_active_profile_line(agent))
+    if not public_context:
+        volatile_parts.append(_active_profile_line(agent))
     volatile_parts.append(_timestamp_line(agent))
     # Keep the renderer-owned runtime anchor after all user/plugin prose so quoted
     # host examples cannot shadow it during persisted-prompt validation.
@@ -830,7 +844,7 @@ def invalidate_system_prompt(agent: Any) -> None:
     if hasattr(agent, "_plugin_system_prompt_sections_snapshot"):
         agent._plugin_system_prompt_sections_previous = agent._plugin_system_prompt_sections_snapshot
         del agent._plugin_system_prompt_sections_snapshot
-    if agent._memory_store:
+    if not _public_context(agent) and agent._memory_store:
         agent._memory_store.load_from_disk()
 
 

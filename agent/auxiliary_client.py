@@ -4346,6 +4346,9 @@ def _try_configured_fallback_for_unavailable_client(
 ) -> tuple[Optional[Any], Optional[str], str]:
     """Task fallback_chain when an explicit aux provider cannot build a client (no key/OAuth/pool creds);
     stops at the per-task chain — the main-agent model stays the runtime last resort."""
+    from agent.fallback_policy import fallback_allowed
+    if not fallback_allowed():
+        return None, None, ""
     explicit = (failed_provider or "").strip().lower()
     if not task or not explicit or explicit in {"auto"}:
         return None, None, ""
@@ -4579,6 +4582,9 @@ def _resolve_auto_route(
     routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
     if routed is not None:
         return routed
+    from agent.fallback_policy import fallback_allowed
+    if not fallback_allowed():
+        return None, None, ""
     if task:
         fb_client, fb_model, fb_label = _try_configured_fallback_chain(
             task, main_provider or "auto", reason="main provider unavailable")
@@ -7289,7 +7295,8 @@ def _resolve_call_client(
             model=resolved_model or model, base_url=resolved_base_url or base_url,
             api_key=resolved_api_key or api_key, async_mode=async_mode, main_runtime=main_runtime,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        from agent.fallback_policy import fallback_allowed
+        if client is None and resolved_provider != "auto" and not resolved_base_url and fallback_allowed():
             logger.warning("Vision provider %s unavailable, falling back to auto vision backends",
                            resolved_provider)
             effective_provider, client, final_model = resolve_vision_provider_client(
@@ -7699,6 +7706,9 @@ def _next_fallback_after_quarantine(
     capacity error): remaining configured entries (task chain, then main chain on auto) before the
     discovery chain. ``task_chain_only`` (explicit-provider auth error) stops at the task chain —
     the user never opted that task into discovery or the main model."""
+    from agent.fallback_policy import fallback_allowed
+    if not fallback_allowed():
+        return None, None, ""
     reason = "fallback candidate unavailable"
     fb = _try_configured_fallback_chain(
         task, resolved_provider or "auto", reason=reason, failed_model=failed_model,
@@ -7723,6 +7733,9 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     response) bypass the explicit-provider gate — the provider cannot serve this request
     regardless of user intent. Auth errors from an explicit provider may only use the task's
     own configured fallback_chain; they never imply an unconfigured provider hop."""
+    from agent.fallback_policy import fallback_allowed
+    if not fallback_allowed(first_err):
+        return None
     task, tag, resolved_provider = route.task, route.tag, route.resolved_provider
     # Respect explicit provider choice for transient errors (auth, request validation, etc.) but fall back when
     # the provider cannot serve due to capacity: payment/quota exhaustion (a daily-token 429 like a 402, #26803),

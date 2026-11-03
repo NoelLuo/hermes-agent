@@ -30,6 +30,37 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 logger = logging.getLogger("gateway.run")
 
 
+def public_conversation_history(history):
+    """Project shared replay to plain public dialogue, never hidden execution state.
+
+    This does not retract text already published to the group or mutate its transcript.
+    Legacy compaction summaries are recognized by the canonical content detector.
+    """
+    from agent.context_compressor import is_compaction_summary_message
+    from agent.message_metadata import is_compaction_scaffolding
+
+    projected = []
+    for row in history or []:
+        if not isinstance(row, dict) or row.get("role") not in {"user", "assistant"}:
+            continue
+        if (is_compaction_scaffolding(row) or is_compaction_summary_message(row)
+                or row.get("display_kind") or row.get("tool_calls") or row.get("tool_call_id")
+                or row.get("hidden") or row.get("_ephemeral")):
+            continue
+        content = row.get("content")
+        if isinstance(content, list):
+            content = "\n".join(part["text"] for part in content
+                                if isinstance(part, dict) and part.get("type") == "text"
+                                and isinstance(part.get("text"), str))
+        if not isinstance(content, str) or not content:
+            continue
+        clean = {"role": row["role"], "content": content}
+        if row.get("timestamp") is not None:
+            clean["timestamp"] = row["timestamp"]
+        projected.append(clean)
+    return projected
+
+
 class GatewaySessionAgentMixin:
     # ── agent resolution (cache reuse vs fresh build) ───────────────────────────────────────
 
@@ -158,7 +189,17 @@ class GatewaySessionAgentMixin:
         from gateway.session_policy import policy_for_source
         from gateway.session_worker_construct import session_prefill
         policy = policy_for_source(runner, src)
-        return ctx.AIAgent(
+        from agent.request_security import policy_scope
+        from gateway.request_security import policy_for_source as requester_policy_for_source
+        request_policy = requester_policy_for_source(runner, src)
+
+        def _construct(**kwargs):
+            with policy_scope(request_policy):
+                agent = ctx.AIAgent(**kwargs)
+            agent._request_security_policy = request_policy
+            return agent
+
+        return _construct(
             model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
             max_iterations=max_iterations, quiet_mode=not bool(policy and policy.verbose), verbose_logging=False,
             enabled_toolsets=ctx.enabled_toolsets, disabled_toolsets=ctx.disabled_toolsets,
@@ -201,6 +242,10 @@ class GatewaySessionAgentMixin:
             user_id_alt=getattr(ctx.source, "user_id_alt", None),
             skip_context_files=skip_context_files,
         )
+        from gateway.request_security import policy_for_source as requester_policy_for_source
+        request_policy = requester_policy_for_source(runner, ctx.source)
+        if request_policy is not None:
+            sig = (sig, request_policy.cache_key())
         cache_lock = getattr(runner, "_agent_cache_lock", None)
         cache = getattr(runner, "_agent_cache", None)
         peek_sid, dead = self._cached_sid_is_dead(cache_lock, cache)
@@ -239,4 +284,6 @@ class GatewaySessionAgentMixin:
                     cache[ctx.session_key] = (agent, sig, msg_count, ctx.session_id)
                     runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, sig)
+        # Every admission resolves the real actor; never carry a previous speaker's grant.
+        agent._request_security_policy = request_policy
         return agent, found.reused

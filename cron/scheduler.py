@@ -1768,6 +1768,9 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         if not (is_auth or is_transient_net):
             raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
 
+        from agent.fallback_policy import fallback_allowed
+        if not fallback_allowed(resolve_exc, jc.cfg):
+            raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
         chain = _job_fallback_chain(job, jc.cfg) or []
         logger.warning(
             "Job '%s': primary provider resolve failed (%s: %s), %s",
@@ -2441,7 +2444,8 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     preflight (may block) -> runtime (+ fallback chain) -> credential pool -> MCP."""
     _cfg = jc.cfg
     setup = _CronAgentSetup(model=jc.model)
-    setup.prefill_messages = _load_prefill_messages(_cfg, job_id)
+    setup.prefill_messages = (None if "request_policy" in job or job.get("public_context_only") is True
+                              else _load_prefill_messages(_cfg, job_id))
 
     # resolve_turn_limit() honors none/unlimited (sys.maxsize) and explicit 0 / null.
     from hermes_cli.config import resolve_turn_limit as _resolve_turn_limit
@@ -2468,7 +2472,8 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     setup.fallback_model = _job_fallback_chain(job, _cfg)
     setup.credential_pool = _load_credential_pool(setup.runtime, job_id)
     # MCP servers must be registered before AIAgent is constructed.
-    _init_cron_mcp_tools(job_id)
+    if "request_policy" not in job:
+        _init_cron_mcp_tools(job_id)
     # Only now can a requested MCP toolset be judged: its alias is process-global but its tools live
     # in this profile's registry overlay, and quiet_mode hides the empty resolution (#109050).
     if _cron_preflight_enabled(_cfg):
@@ -2478,7 +2483,85 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
     return setup
 
 
+def _admin_public_context_policy(job: dict):
+    """Re-authorize trusted creation provenance; the marker itself grants no tool rights."""
+    from types import SimpleNamespace
+    from gateway.config import load_gateway_config
+    from gateway.request_security import policy_from_extra
+    from hermes_constants import get_hermes_home, profile_name_for_home
+
+    if job.get("public_context_only") is not True or "request_policy" in job:
+        raise ValueError("Invalid or conflicting public-context metadata")
+    author = job.get("public_context_author")
+    keys = {"subject_id", "platform", "chat_id", "scope_id"}
+    if (not isinstance(author, dict) or set(author) != keys
+            or any(not isinstance(author[k], str) or not author[k] for k in keys)
+            or author["platform"] != "qqbot"):
+        raise ValueError("Public-context cron is missing its bound author")
+    if author["scope_id"] != profile_name_for_home(get_hermes_home()):
+        raise ValueError("Public-context cron belongs to a different profile")
+    origin = job.get("origin")
+    if not isinstance(origin, dict) or (
+            origin.get("platform"), origin.get("chat_id"), origin.get("user_id")) != (
+            "qqbot", author["chat_id"], author["subject_id"]):
+        raise ValueError("Public-context cron origin does not match its author")
+    try:
+        config = load_gateway_config()  # Owning profile scope, fresh on EVERY fire/construction.
+        platforms = config.platforms
+        qq = next((value for key, value in platforms.items()
+                   if getattr(key, "value", key) == "qqbot"), None)
+        extra = getattr(qq, "extra", None)
+        if extra is None and isinstance(qq, dict):
+            extra = qq
+        source = SimpleNamespace(platform="qqbot", chat_type="group",
+                                 user_id=author["subject_id"], chat_id=author["chat_id"])
+        policy = policy_from_extra(extra, source, scope_id=author["scope_id"])
+    except Exception as exc:
+        raise ValueError("Cannot revalidate public-context cron author") from exc
+    if policy is None or not policy.is_admin or not policy.public_context:
+        raise ValueError("Public-context cron author is no longer a configured group admin")
+    return policy
+
+
+def _public_cron_policy(job: dict):
+    """Missing metadata is legacy; malformed/power-escalating metadata is never legacy."""
+    if "public_context_only" in job or "public_context_author" in job:
+        return _admin_public_context_policy(job)
+    if "request_policy" not in job:
+        return None
+    from agent.request_security import RequestSecurityPolicy
+    from cron.jobs import validate_public_cron_job
+    policy = RequestSecurityPolicy.from_payload(job["request_policy"])
+    if "cronjob_manage" in policy.allowed_tools:
+        raise ValueError("Public scheduled jobs cannot create additional jobs")
+    validate_public_cron_job(job, policy)
+    return policy
+
+
+def _filter_public_cron_media(content: str, policy) -> str:
+    """Authorize attachments against the SAME in-memory policy used by the running agent."""
+    from gateway.platforms.base import BasePlatformAdapter
+    media, cleaned = BasePlatformAdapter.extract_media(content)
+    approved = [path for path, _voice in media if policy.allows_media(path)]
+    # Re-emitted tags are exclusively those the trusted tool/artifact ledger granted.
+    return cleaned + ''.join(f'\nMEDIA:{path}' for path in approved)
+
+
 def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
+    from agent.request_security import current_policy, policy_scope
+    policy = _public_cron_policy(job)
+    active = current_policy()
+    if policy is not None and active is not None and active.cache_key() == policy.cache_key():
+        policy = active  # Preserve this run's artifact ledger across construction and tool execution.
+    with policy_scope(policy):
+        agent = _construct_cron_agent_scoped(
+            AIAgent, job, _cfg, setup, workdir=workdir, session_id=session_id, session_db=session_db)
+        agent._request_security_policy = policy
+        return agent
+
+
+def _construct_cron_agent_scoped(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
+    public = "request_policy" in job or job.get("public_context_only") is True
     runtime = setup.runtime
     pr = _cfg.get("provider_routing") or {}
     return AIAgent(
@@ -2493,7 +2576,7 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         acp_args=runtime.get("args"),
         max_iterations=setup.max_iterations,
         reasoning_config=setup.reasoning_config,
-        prefill_messages=setup.prefill_messages,
+        prefill_messages=None if public else setup.prefill_messages,
         fallback_model=setup.fallback_model,
         credential_pool=setup.credential_pool,
         providers_allowed=pr.get("only"),
@@ -2504,10 +2587,10 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
         disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
         quiet_mode=True,
-        # Project context files only with a configured workdir; SOUL.md always.
-        skip_context_files=not bool(workdir),
-        load_soul_identity=True,
-        skip_memory=False,
+        # Public automatic context is isolated even when admin tools retain a workdir.
+        skip_context_files=public or not bool(workdir),
+        load_soul_identity=not public,
+        skip_memory=public,
         skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
         platform="cron",
         session_id=session_id,
@@ -2540,6 +2623,21 @@ class _FireAudit:
 
 
 def run_job(
+    job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
+    cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
+) -> tuple[bool, str, str, Optional[str]]:
+    from agent.request_security import policy_scope
+    try:
+        policy = _public_cron_policy(job)
+    except ValueError as exc:
+        return False, "", "", f"Invalid public cron policy: {exc}"
+    with policy_scope(policy):
+        return _run_job_scoped(
+            job, defer_agent_teardown=defer_agent_teardown, extra_prompt=extra_prompt,
+            cancel_event=cancel_event, execution_id=execution_id)
+
+
+def _run_job_scoped(
     job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -2610,6 +2708,8 @@ def run_job(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             worker_state=_worker_state)
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
+        if "request_policy" in job:
+            final_response = _filter_public_cron_media(final_response, agent._request_security_policy)
         if (setup.fallback_notice and final_response.strip() and not _is_cron_silence_response(final_response)
                 and _cron_failure_marker_error(final_response) is None):
             # Pre-agent provider switch (#74349) rides with the delivered report; silence and the
@@ -2969,6 +3069,10 @@ def _compose_run_delivery(
                 # The one alert on entering a provider-window hold says so (#89376).
                 + hold_notice(job, job.get("_quota_hold_seconds"))
             )
+    if "request_policy" in job and not success:
+        # Failure wrappers include model-supplied names/diagnostics, not artifact grants.
+        from gateway.platforms.base import BasePlatformAdapter
+        _, deliver_content = BasePlatformAdapter.extract_media(deliver_content)
     return deliver_content, blocked_config, blocked_config_silent, incident_acked, failure_incident_id
 
 

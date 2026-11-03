@@ -66,7 +66,10 @@ def _adapter_event(event, **changes):
     """An adapter's event at the envelope boundary: an absent media list (``None``) is no media.
     Any other non-list still reaches ``_validate_native`` and refuses."""
     changes.update({name: [] for name in _MEDIA_FIELDS if getattr(event, name) is None})
-    return _drop_remote_media(replace(event, **changes) if changes else event)
+    frozen = replace(event, **changes) if changes else event
+    if frozen is not event and hasattr(event, '_inbound_attachment_receipts'):
+        frozen._inbound_attachment_receipts = deepcopy(event._inbound_attachment_receipts)
+    return _drop_remote_media(frozen)
 
 
 def _drop_remote_media(event):
@@ -189,13 +192,17 @@ def _validate_native(runner, event, provenance=None, fresh_roles=False):
 
 def snapshot_native(runner, event):
     from gateway.session_ingress_context import capture_provenance
+    from gateway.native_adapter_turns import snapshot_adapter_turn
     provenance = capture_provenance(runner, event)
-    return _snapshot_native(runner, _adapter_event(event), provenance)
+    state = snapshot_adapter_turn(runner, event)
+    return _snapshot_native(runner, _adapter_event(event), provenance, adapter_turn=state)
 
 
 async def prepare_native(runner, event):
     from gateway.session_ingress_context import capture_provenance, reauthorize_roles
+    from gateway.native_adapter_turns import snapshot_adapter_turn
     provenance = capture_provenance(runner, event)
+    state = snapshot_adapter_turn(runner, event)
     # Freeze caller-owned identity and content before the first network yield.
     # Preserve dynamic trust fields too: validation must reject forged ones,
     # not silently discard them while freezing the caller's source identity.
@@ -228,16 +235,18 @@ async def prepare_native(runner, event):
         except BaseException:
             await abandon_capture(scope)
             raise
-    return _snapshot_native(runner, frozen, provenance, fresh_roles, encoded_source, media)
+    return _snapshot_native(runner, frozen, provenance, fresh_roles, encoded_source, media, adapter_turn=state)
 
 
-def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_source=None, media=None):
+def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_source=None, media=None, *, adapter_turn=None):
     if encoded_source is None:
         encoded_source = _validate_native(runner, event, provenance, fresh_roles)
     envelope = {'source': encoded_source,
                 'route': runner.session_store._generate_session_key(event.source),
                 'event': deepcopy({name: getattr(event, name) for name in _EVENT_FIELDS}),
                 'timestamp': event.timestamp.isoformat()}
+    if adapter_turn is not None:
+        envelope['adapter_turn'] = adapter_turn
     if event.source.platform.value == 'webhook':
         from gateway.platforms.webhook_delivery import route_digest, snapshot_destination
         adapter = runner._adapter_for_source(event.source)
@@ -263,6 +272,11 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
         envelope['message_type'] = event.message_type.value
     if event.media_urls:
         envelope['media'] = media if media is not None else capture_native_media(event.media_urls)
+        if event.source.platform.value == 'qqbot':
+            from gateway.inbound_attachment_proofs import relocate_receipts
+            receipts = relocate_receipts(event, envelope['media'])
+            if receipts:
+                envelope['qq_attachment_receipts'] = receipts
         envelope['event'].update(media_types=list(event.media_types),
                                  media_text_inlined=list(event.media_text_inlined))
         if any(event.media_filenames):  # absent when unnamed: older admissions keep their fingerprint
@@ -314,6 +328,8 @@ def restore_native(payload, runner=None):
                         message_type=MessageType(envelope.get('message_type', 'text')),
                         media_urls=restore_native_media(envelope.get('media', [])),
                         **deepcopy(envelope['event']))
+    if source.platform.value == 'qqbot':
+        event._inbound_attachment_receipts = deepcopy(envelope.get('qq_attachment_receipts', []))
     if 'automation' in envelope:
         event.internal = True
         if envelope['automation'].get('heartbeat'):
@@ -323,6 +339,8 @@ def restore_native(payload, runner=None):
         from gateway.session_automation import automation_display_metadata, automation_notification_metadata
         event.metadata.update(automation_notification_metadata(envelope['automation']))
         event.metadata.update(automation_display_metadata(envelope['automation']))
+    from gateway.native_adapter_turns import restore_adapter_turn
+    restore_adapter_turn(runner, event, envelope.get('adapter_turn'))
     return event
 
 

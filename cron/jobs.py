@@ -425,7 +425,42 @@ def fire_claim_fence(job_id: str, *, expected_owner: str):
 
 # Fields that must never change after creation: ``id`` is a path component under OUTPUT_DIR, so an
 # update could leak ``../escape``/absolute/nested values into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+_IMMUTABLE_JOB_FIELDS = frozenset({"id", "request_policy", "public_context_only", "public_context_author"})
+
+
+_PUBLIC_CRON_FORBIDDEN = (
+    "script", "monitor_script", "monitor_url", "base_url", "api_key", "context_from",
+    "skill", "skills", "workdir", "no_agent", "model", "provider", "interpreter",
+    "attach_to_session", "continuity", "pinned",
+)
+
+
+def validate_public_cron_job(job: dict[str, Any], policy) -> None:
+    """Validate the persisted boundary again before any script/context/agent processing."""
+    if policy.is_admin or not policy.public_context or policy.platform != "qqbot":
+        raise ValueError("Public cron requires a QQ public guest policy")
+    chat_id = policy.chat_id
+    if not isinstance(chat_id, str) or not chat_id or any(c in chat_id for c in (':', ',', chr(13), chr(10))):
+        raise ValueError("Public cron source is not safely routable")
+    from hermes_constants import get_hermes_home, profile_name_for_home
+    if policy.scope_id != profile_name_for_home(get_hermes_home()):
+        raise ValueError("Public cron policy belongs to a different profile")
+    target = f"qqbot:{chat_id}"
+    if job.get("deliver") != target or job.get("failure_deliver") not in (None, target):
+        raise ValueError("Public cron delivery must remain in the source chat")
+    origin = job.get("origin") or {}
+    if not isinstance(origin, dict):
+        raise ValueError("Public cron origin is malformed")
+    if (origin.get("platform"), origin.get("chat_id"), origin.get("user_id")) != (
+            "qqbot", chat_id, policy.subject_id):
+        raise ValueError("Public cron origin does not match its policy")
+    if 'MEDIA:' in str(job.get('name') or '').upper():
+        raise ValueError("Public cron names cannot carry media delivery directives")
+    if any(job.get(field) for field in _PUBLIC_CRON_FORBIDDEN):
+        raise ValueError("Public cron permits natural-language reminders/public queries only")
+    if job.get("enabled_toolsets") not in (None, [], ["web"]):
+        raise ValueError("Public cron cannot select privileged toolsets")
+
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -1848,6 +1883,37 @@ def create_job(
     (a venv can be rebuilt or moved after creation). timezone: IANA key pinning the schedule's
     wall clock (None/'' = inherit the profile zone). grace_minutes: catch-up window override
     (0 = never catch up)."""
+    from agent.request_security import current_policy, RequestSecurityPolicy
+    request_policy = current_policy()
+    public_context_author = None
+    if (request_policy is not None and request_policy.platform == "qqbot"
+            and request_policy.is_admin and request_policy.public_context):
+        if not request_policy.subject_id or not request_policy.chat_id:
+            raise ValueError("Public admin cron requires a bound requester and source chat")
+        # This is provenance, NOT a durable admin grant. Every consumer rechecks live config.
+        public_context_author = {
+            "subject_id": request_policy.subject_id, "platform": "qqbot",
+            "chat_id": request_policy.chat_id, "scope_id": request_policy.scope_id,
+        }
+        origin = {"platform": "qqbot", "chat_id": request_policy.chat_id,
+                  "user_id": request_policy.subject_id}
+    public_policy = (request_policy if request_policy is not None and
+                     request_policy.platform == "qqbot" and not request_policy.is_admin else None)
+    if public_policy is not None:
+        raw_public = dict(locals())
+        if not public_policy.allows_tool("cronjob_manage", {"action": "create"}):
+            raise ValueError("Public cron creation is not authorized")
+        if any(raw_public.get(key) for key in _PUBLIC_CRON_FORBIDDEN):
+            raise ValueError("Public cron forbids execution, context and provider overrides")
+        target = f"qqbot:{public_policy.chat_id}"
+        if deliver not in (None, "origin", target) or failure_deliver not in (None, target):
+            raise ValueError("Public cron must deliver to the source chat")
+        deliver = failure_deliver = target
+        origin = {"platform": "qqbot", "chat_id": public_policy.chat_id,
+                  "user_id": public_policy.subject_id}
+        # Round-trip the safe-only serializer before persisting any job.
+        public_policy = RequestSecurityPolicy.from_payload(public_policy.to_payload())
+        enabled_toolsets = ["web"] if enabled_toolsets is None else enabled_toolsets
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
@@ -1943,6 +2009,12 @@ def create_job(
         if value is not None:
             job[key] = value
 
+    if public_context_author is not None:
+        job["public_context_only"] = True
+        job["public_context_author"] = public_context_author
+    if public_policy is not None:
+        job["request_policy"] = public_policy.to_payload()
+        validate_public_cron_job(job, public_policy)
     with _jobs_lock():
         save_jobs(load_jobs() + [job])
     return job
@@ -2124,6 +2196,8 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
         raise ValueError(f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}")
 
     def apply(jobs, i, job):
+        if "public_context_only" in job and "origin" in updates:
+            raise ValueError("Public cron origin cannot be updated")
         _rederive_repeat_for_schedule_change(job, updates)
         _normalize_job_updates(job, updates)
         _apply_pin_update(job, updates)

@@ -96,10 +96,12 @@ def _single_row_keyboard(group_id: str, *buttons: tuple) -> InlineKeyboard:
     return InlineKeyboard(content=KeyboardContent(rows=[row]))
 
 
-def build_approval_keyboard(session_key: str, *, allow_permanent: bool = True) -> InlineKeyboard:
+def build_approval_keyboard(session_key: str, *, allow_permanent: bool = True, request_id: str = "") -> InlineKeyboard:
     """Build ``[✅ 允许一次] [⭐ 始终允许] [❌ 拒绝]`` (one group, so a click greys the rest). ⭐ is hidden when
     persistent scope is unavailable; *session_key* rides in ``button_data`` so the decision routes correctly."""
     prefix = f"{APPROVAL_BUTTON_PREFIX}{session_key}"
+    if request_id:
+        prefix = f"approve-request:{request_id}:{session_key}"
     buttons = [("allow", "✅ 允许一次", "已允许", f"{prefix}:allow-once", 1)]
     if allow_permanent:
         buttons.append(("always", "⭐ 始终允许", "已始终允许", f"{prefix}:allow-always", 1))
@@ -126,6 +128,7 @@ class ApprovalRequest:
     severity: str = ""
     timeout_sec: int = 120
     allow_permanent: bool = True
+    request_id: str = ""
 
 
 _SEVERITY_ICONS = {"critical": "🔴", "info": "🔵"}
@@ -150,6 +153,8 @@ def build_approval_text(req: ApprovalRequest) -> str:
         if req.tool_name:
             lines.append(f"🔧 工具: {req.tool_name}")
     lines += ["", f"⏱️ 超时: {req.timeout_sec} 秒"]
+    if req.request_id:
+        lines += [f"请求ID: {req.request_id}", f"/approve request:{req.request_id}", f"/deny request:{req.request_id}"]
     return "\n".join(lines)
 
 

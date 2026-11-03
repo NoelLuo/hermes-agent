@@ -369,14 +369,18 @@ def _tool_search_scoped_names(agent) -> frozenset:
         from tools import tool_search as _ts
     except Exception:
         return frozenset()
+    request_policy = getattr(agent, "_request_security_policy", None)
     try:
-        return _ts.scoped_deferrable_names(model_tools.get_tool_definitions(
+        names = _ts.scoped_deferrable_names(model_tools.get_tool_definitions(
             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
             quiet_mode=True, skip_tool_search_assembly=True,
         ) or [])
     except Exception:
-        return frozenset()
+        names = frozenset()
+    if request_policy is not None and not request_policy.is_admin:
+        names = frozenset(name for name in names if name in request_policy.allowed_tools)
+    return names
 
 
 def _canonical_tool_name(function_name: str) -> str:
@@ -675,6 +679,28 @@ def _pre_tool_block(agent, ref: _ToolCallRef):
         return None, ref.args
 
 
+def _grant_generated_audio(request_policy, name: str, result) -> None:
+    """Only the TTS producer's structured success fields confer media authority.
+
+    Page text and MEDIA directives are untrusted and never create grants.
+    """
+    if request_policy is None or name != "text_to_speech":
+        return
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except (TypeError, ValueError):
+            return
+    if not isinstance(result, dict) or result.get("success") is not True:
+        return
+    paths = [result.get("file_path")]
+    if isinstance(result.get("file_paths"), list):
+        paths.extend(result["file_paths"])
+    for path in paths:
+        if isinstance(path, str):
+            request_policy.grant_artifact(path)
+
+
 def _dispatch_authorized_once(
     agent,
     state: _ManagedToolResult,
@@ -698,13 +724,27 @@ def _dispatch_authorized_once(
         elif callback is not None:
             callback()
 
+    from agent.request_security import current_policy, policy_scope
+    request_policy = getattr(agent, "_request_security_policy", None) or current_policy()
     block_message, block_error_type = scope_block, "tool_scope_block"
+    if request_policy is not None and not request_policy.allows_tool(ref.name, ref.args):
+        block_message, block_error_type = "Requester is not authorized to execute this tool.", "request_security_denied"
     if block_message is None:
         block_error_type = "plugin_block"
         resolve = lambda: _pre_tool_block(agent, ref)
         block_message, ref.args = resolve() if authorization_gate is None else authorization_gate.run(resolve)
         state.args = ref.args
+    if block_message is None and request_policy is not None and not request_policy.allows_tool(ref.name, ref.args):
+        block_message, block_error_type = "Requester is not authorized to execute this tool with these arguments.", "request_security_denied"
+    if (block_error_type == "request_security_denied" and request_policy is not None
+            and request_policy.subject_id and request_policy.chat_id
+            and ref.name == "guest_browser" and ref.name in request_policy.allowed_tools
+            and isinstance(ref.args, dict) and 'action' not in ref.args):
+        block_message = 'Missing required action. Use action="browse" with url and actions, or action="info".'
+        block_error_type = "invalid_arguments"
     block_body = None if block_message is None else {"error": block_message}
+    if block_error_type == "invalid_arguments":
+        block_body.update(error_type="invalid_arguments", missing=["action"])
 
     # Checked once, after plugin modify hooks (which may replace arguments) and
     # before guardrails or real dispatch: a copied compression marker in an
@@ -741,11 +781,16 @@ def _dispatch_authorized_once(
     from agent.terminal_approval_batch import prepare_current_terminal
     prepare_current_terminal(ref)
     _advance_start_order(lambda: _begin_tool_execution(agent, ref, display_index))
+    def _execute_scoped():
+        with policy_scope(request_policy):
+            result = execute(ref.args)
+            _grant_generated_audio(request_policy, ref.name, result)
+            return result
     from agent.tool_progress_relay import bound_tool_progress
     from tools.connectors.data_use import collect_data_use
     with bound_tool_progress(agent.tool_progress_callback, ref.name, ref.call_id), collect_data_use() as data_use:
         try:
-            return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
+            return _run_with_activity_heartbeat(agent, ref.name, _execute_scoped)
         finally:
             state.data_use = frozenset(data_use)
 

@@ -46,6 +46,10 @@ def _inbound_cwd(runner, source):
 
 async def inbound_references(runner, source, session_key, text):
     """``expand_references`` for an inbound turn: a local session's policy cwd, else the terminal cwd."""
+    from gateway.request_security import policy_for_source
+    request_policy = policy_for_source(runner, source)
+    if request_policy is not None and request_policy.public_context:
+        return text, None
     try:
         cwd = _inbound_cwd(runner, source)
         context_length = await runner._inbound_model_context_length(source, session_key)
@@ -62,6 +66,12 @@ async def turn_references(runner, event, source, session_key, text):
     execution, and the returned text, the stored user row, is ``text`` with the same attached
     context, as a typed turn stores it: later turns still read the content. A refused local turn
     leaves its refusal on ``event`` for the prepare step to answer with."""
+    from gateway.request_security import policy_for_source
+    request_policy = policy_for_source(runner, source)
+    if request_policy is not None and request_policy.public_context:
+        # Reference expansion performs host I/O before any model/tool gate. Public
+        # messages remain literal, including administrator messages in a group.
+        return text
     from gateway.session_cli_turn import cli_turn, rebind_api_text
     api_text = cli_turn(event.message_id).get('api_text')
     target = text if api_text is None else api_text

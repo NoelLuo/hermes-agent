@@ -21,7 +21,7 @@ import time
 import uuid
 from datetime import datetime, timezone, UTC
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, List, Optional, Tuple
 from urllib.parse import urlparse
 
 try:
@@ -68,6 +68,13 @@ from .constants import (
     DEDUP_WINDOW_SECONDS, DEDUP_MAX_SIZE, MSG_TYPE_TEXT, MSG_TYPE_MARKDOWN, MSG_TYPE_MEDIA,
     MSG_TYPE_INPUT_NOTIFY, MEDIA_TYPE_IMAGE, MEDIA_TYPE_VIDEO, MEDIA_TYPE_VOICE, MEDIA_TYPE_FILE)
 from .utils import coerce_list as _coerce_list, build_user_agent
+from .markdown import normalize_qq_markdown
+from .reply_gate import GroupReplyGate
+from .group_images import QuietGroupImages
+from .group_events import GroupEventDispatcher
+from .long_reply import LongReplyPreview
+from .meme_delivery import MemeDeliveryMixin
+from .memes import capture_turn as _capture_meme_turn
 from .chunked_upload import (
     ChunkedUploader, UploadDailyLimitExceededError, UploadFileTooLargeError)
 from .keyboards import (
@@ -97,7 +104,7 @@ _STT_PROVIDER_BASE_URLS = {
 _AUDIO_URL_EXTENSIONS = {".silk", ".amr", ".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"}
 
 
-class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
+class QQAdapter(MemeDeliveryMixin, OwnAccessPolicyMixin, BasePlatformAdapter):
     """QQ Bot adapter backed by the official QQ Bot WebSocket Gateway + REST API."""
 
     # QQ Bot API does not support editing sent messages.
@@ -153,6 +160,23 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._allow_from = _coerce_list(extra.get("allow_from") or extra.get("allowFrom"))
         self._group_policy = str(extra.get("group_policy", "pairing")).strip().lower()
         self._group_allow_from = _coerce_list(extra.get("group_allow_from") or extra.get("groupAllowFrom"))
+
+        self._group_reply_gate = GroupReplyGate(extra)
+        self._group_images = QuietGroupImages()
+        self._group_events = GroupEventDispatcher()
+        self._long_reply_preview = LongReplyPreview(extra)
+        from hermes_constants import get_hermes_home
+        try:
+            self._receipt_home = get_hermes_home()
+        except RuntimeError:
+            self._receipt_home = None
+        options = extra.get("group_reply_gate", {})
+        self._assistant_label = (self._group_reply_gate.settings.names[0]
+                                 if isinstance(options, dict) and options.get("assistant_names") else "小汐")
+        self._bot_id: Optional[str] = None
+        self._home_channel = _resolve_qq_secret("QQBOT_HOME_CHANNEL", "")
+        self._group_context_cache: dict[str, list[tuple[str, str]]] = {}
+        self._group_context_max = int(_resolve_qq_secret("QQBOT_GROUP_CONTEXT_MAX", "60") or 60)
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
@@ -306,14 +330,35 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     async def _open_ws(self, gateway_url: str) -> None:
         await self._close_ws()
-        # Honor proxy env vars for the WebSocket (WSL setups need this).
-        self._session = aiohttp.ClientSession(trust_env=gateway_trust_env())
+        # Local patch: try the proxy first, then fall back to a direct connection,
+        # so the bot connects whether or not the user's proxy is running.
         proxy_vars = ("WSS_PROXY", "wss_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
         ws_proxy = next((v for v in map(os.getenv, proxy_vars) if v), None)
-        self._ws = await self._session.ws_connect(
-            gateway_url, headers={"User-Agent": build_user_agent()}, timeout=CONNECT_TIMEOUT_SECONDS, proxy=ws_proxy,
-        )
-        logger.info("[%s] WebSocket connected to %s", self._log_tag, gateway_url)
+
+        attempts = [("proxy", ws_proxy)] if ws_proxy else []
+        attempts.append(("direct", None))
+
+        last_error: Optional[Exception] = None
+        for label, proxy in attempts:
+            try:
+                self._session = aiohttp.ClientSession(trust_env=False)
+                self._ws = await self._session.ws_connect(
+                    gateway_url, headers={"User-Agent": build_user_agent()},
+                    timeout=CONNECT_TIMEOUT_SECONDS, proxy=proxy,
+                )
+                logger.info("[%s] WebSocket connected via %s to %s", self._log_tag, label, gateway_url)
+                return
+            except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+                last_error = exc
+                logger.debug("[%s] WebSocket %s attempt failed: %s", self._log_tag, label, exc)
+                if self._session and not self._session.closed:
+                    with contextlib.suppress(Exception):
+                        await self._session.close()
+                self._session = None
+                self._ws = None
+        raise RuntimeError(
+            f"Failed to connect WebSocket to {gateway_url} (tried {len(attempts)} method(s))"
+        ) from last_error
 
     async def _listen_loop(self) -> None:
         """Read WebSocket events and reconnect on errors. Close codes: 4004 → refresh
@@ -470,11 +515,11 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     async def _send_identify(self) -> None:
         """Send op 2 Identify (reply to Hello); server answers with READY. Intents:
-        C2C_GROUP_AT_MESSAGES | PUBLIC_GUILD_MESSAGES | DIRECT_MESSAGE | INTERACTION."""
+        C2C_GROUP_AT_MESSAGES | DIRECT_MESSAGE | INTERACTION."""
         token = await self._ensure_token()
         payload = {"op": 2, "d": {
             "token": f"QQBot {token}",
-            "intents": (1 << 25) | (1 << 30) | (1 << 12) | (1 << 26),
+            "intents": (1 << 25) | (1 << 12) | (1 << 26),
             "shard": [0, 1],
             "properties": {"$os": "macOS", "$browser": "hermes-agent", "$device": "hermes-agent"}}}
         await self._send_ws_auth("Identify", payload, "Identify sent")
@@ -521,13 +566,15 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             if t == "READY":
                 if isinstance(d, dict):  # store session_id for resume
                     self._session_id = d.get("session_id")
+                    user = d.get("user") if isinstance(d.get("user"), dict) else {}
+                    self._bot_id = user.get("id")
                     logger.info("[%s] Ready, session_id=%s", self._log_tag, self._session_id)
             elif t == "RESUMED":
                 logger.info("[%s] Session resumed", self._log_tag)
             elif t in self._INBOUND_HANDLERS:
                 asyncio.create_task(self._on_message(t, d))
             elif t == "INTERACTION_CREATE":
-                self._create_task(self._on_interaction(d))
+                self._create_task(self._on_interaction(d, event_id=payload.get("id")))
             else:
                 logger.debug("[%s] Unhandled dispatch: %s", self._log_tag, t)
         elif op == 11:  # Heartbeat ACK
@@ -575,6 +622,9 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     async def _on_message(self, event_type: str, d: Any) -> None:
         if not isinstance(d, dict):
             return
+        if event_type in {"GROUP_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE"}:
+            await self._group_events.dispatch(self, event_type, d)
+            return
         msg_id = str(d.get("id", ""))
         if not msg_id or self._dedup.is_duplicate(msg_id):
             logger.debug("[%s] Duplicate or missing message id: %s", self._log_tag, msg_id)
@@ -591,7 +641,7 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         """Register (or clear) the callback invoked per ACKed INTERACTION_CREATE."""
         self._interaction_callback = callback
 
-    async def _on_interaction(self, d: Any) -> None:
+    async def _on_interaction(self, d: Any, *, event_id: Optional[str] = None) -> None:
         """Parse INTERACTION_CREATE, ACK it promptly (else the client shows an error
         icon on the button), then dispatch to the registered callback."""
         if not isinstance(d, dict):
@@ -603,6 +653,10 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             return
         if not event.id:
             logger.warning("[%s] INTERACTION_CREATE missing id, skipping ACK", self._log_tag)
+            return
+
+        if self._long_reply_preview.owns(event):
+            await self._long_reply_preview.on_interaction(self, event, event_id=event_id)
             return
 
         try:
@@ -662,13 +716,24 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
         chat_type = parsed.get("chat_type", "")
         chat_id = parsed.get("chat_id", "")
+        if chat_type not in {"dm", "c2c", "group", "guild"}:
+            return False
         # Approval keys come from build_source (chat_type="dm"); update-prompt keys from event.scene ("c2c").
         if chat_type in {"c2c", "dm"}:
-            return bool(chat_id) and operator == chat_id
+            if not chat_id or operator != chat_id or event.scene not in {"c2c", "dm"}:
+                return False
         if chat_type in {"group", "guild"}:
             event_chat = str(event.group_openid or event.guild_id or "").strip()
             if not event_chat or event_chat != chat_id:
                 return False
+        from gateway.request_security import policy_for_adapter
+        source = self.build_source(chat_id=chat_id, chat_type=chat_type, user_id=operator)
+        policy = policy_for_adapter(self, source)
+        if policy is not None:
+            return policy.is_admin
+        if chat_type in {"c2c", "dm"}:
+            return True
+        if chat_type in {"group", "guild"}:
             session_user = str(parsed.get("user_id", "")).strip()
             return bool(session_user) and operator == session_user
         return False
@@ -686,7 +751,12 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         button_data = event.button_data
         if not button_data:
             return
-
+        request_id = ""
+        if button_data.startswith("approve-request:"):
+            if button_data.count(":") < 3:
+                return
+            _, request_id, tail = button_data.split(":", 2)
+            button_data = "approve:" + tail
         approval = parse_approval_button_data(button_data)
         if approval is not None:
             session_key, decision = approval
@@ -699,9 +769,15 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     "[%s] Rejected unauthorized approval click for session %s (operator=%s)",
                     self._log_tag, session_key, event.operator_openid)
                 return
+            from gateway.request_security import policy_for_adapter
+            parsed = self._parse_gateway_session_key(session_key)
+            source = self.build_source(chat_id=parsed["chat_id"], chat_type=parsed["chat_type"], user_id=event.operator_openid)
+            if policy_for_adapter(self, source) is not None and not request_id:
+                return  # Legacy cards must not resolve whichever request happens to be newest.
             try:
                 from tools.approval import resolve_gateway_approval  # lazy: keep adapter light
-                count = resolve_gateway_approval(session_key, choice)
+                count = (resolve_gateway_approval(session_key, choice, request_id=request_id)
+                         if request_id else resolve_gateway_approval(session_key, choice))
                 logger.info(
                     "[%s] Button resolved %d approval(s) for session %s (choice=%s, operator=%s)",
                     self._log_tag, count, session_key, choice, event.operator_openid)
@@ -709,6 +785,13 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 logger.error("[%s] resolve_gateway_approval failed for session %s: %s", self._log_tag, session_key, exc)
             return
 
+        update_token = ""
+        if button_data.startswith("update-request:"):
+            parts = button_data.split(":")
+            if len(parts) != 3:
+                return
+            _, update_token, answer = parts
+            button_data = "update_prompt:" + answer
         update_answer = parse_update_prompt_button_data(button_data)
         if update_answer is not None:
             chat = event.group_openid or event.guild_id or event.user_openid
@@ -717,6 +800,13 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     "[%s] Rejected unauthorized update prompt click (operator=%s)", self._log_tag, event.operator_openid
                 )
                 return
+            from gateway.request_security import policy_for_adapter
+            source = self.build_source(chat_id=chat, chat_type=event.scene, user_id=event.operator_openid)
+            if policy_for_adapter(self, source) is not None:
+                cards = getattr(self, "_role_update_cards", {})
+                if not update_token or cards.get(chat) != update_token:
+                    return
+                cards.pop(chat, None)
             self._write_update_response(update_answer, event.operator_openid)
             return
 
@@ -738,9 +828,17 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     async def _handle_c2c_message(self, d, msg_id, content, author, timestamp) -> None:
         user_openid = str(author.get("user_openid", ""))
-        if not user_openid or not self._is_dm_intake_allowed(user_openid):
+        if not user_openid:
+            logger.info("[%s] C2C message without user_openid — dropped", self._log_tag)
+            return
+        if not self._is_dm_intake_allowed(user_openid):
+            logger.info(
+                "[%s] C2C from %s dropped by dm_policy=%s (opt_in=%s)",
+                self._log_tag, user_openid, self._dm_policy, self._open_dm_opted_in())
             return
 
+        # Local patch: strip the '/' QQ's command panel prepends to non-ASCII entries.
+        content = self._normalize_panel_command(content)
         attachments_raw = d.get("attachments")
         logger.info(
             "[%s] C2C message: id=%s content=%r attachments=%s",
@@ -764,9 +862,81 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         member = str(author.get("member_openid", ""))
         if not group_openid or not self._is_group_allowed(group_openid, member):
             return
+
+        from .group_identity import strip_bot_invocation
+        bot_ids = {str(value) for value in (self.config.extra.get("bot_member_openid"),) if value}
+        mentions = d.get("mentions")
+        if isinstance(mentions, list):
+            bot_ids.update(str(m["id"]) for m in mentions
+                           if isinstance(m, dict) and m.get("is_you") is True and m.get("id"))
+        text = self._normalize_panel_command(strip_bot_invocation(content, bot_ids))
+
+        self._group_reply_gate.note_addressed(group_openid)
+
+        # Local patch: a bare slash command must reach the gateway *untagged* —
+        # the "[当前消息] [群聊-*]" prefix + injected context would otherwise
+        # defeat MessageEvent.is_command() (text.startswith("/")).
+        _cmd = text.strip()
+        if _cmd.startswith("/") and not _cmd[1:].strip().startswith("/") and not d.get("attachments"):
+            from gateway.platforms.base import resolve_channel_prompt
+            self._chat_type_map[group_openid] = "group"
+            event = MessageEvent(
+                source=self.build_source(chat_id=group_openid, user_id=member, chat_type="group"),
+                text=_cmd, message_type=MessageType.TEXT, raw_message=d,
+                message_id=msg_id, timestamp=self._parse_qq_timestamp(timestamp),
+                channel_prompt=resolve_channel_prompt(self.config.extra, group_openid))
+            # Reset the nearby-message buffer too: otherwise the first turn
+            # of the new session inherits pre-reset chat via context injection.
+            # Clear only after the gateway accepted/handled the reset command.
+            await self.handle_message(event)
+            if _cmd.split(maxsplit=1)[0].lower() in {"/new", "/reset"}:
+                self._group_context_cache.pop(group_openid, None)
+            return
+
+        # Local patch: inject the group's rolling transcript, then tag the
+        # current message with the speaker's identity (管理员 vs 群友-*) so the
+        # model can always tell who is talking — even for a bare @bot.
+        context_lines = ([] if self._group_reply_gate.enabled(group_openid)
+                         else self._render_group_context(group_openid))
+        context_lines.append("[当前消息]")
+        speaker = self._speaker_label(member, author)
+        text_body = text.strip()
+        if text_body:
+            context_lines.append(f"[群聊-{speaker}] {text_body}")
+        else:
+            context_lines.append(f"[群聊-{speaker}] （空消息：仅 @ 了机器人，无文字内容）")
+        self._record_group_turn(group_openid, speaker, text_body or "（空消息：仅 @ 了机器人）")
+
         await self._ingest(
-            d, msg_id, self._strip_at_mention(content), d.get("attachments"), timestamp,
-            chat_id=group_openid, qq_chat_type="group", user_id=member, chat_type="group")
+            d, msg_id, "\n".join(context_lines), d.get("attachments"), timestamp,
+            chat_id=group_openid, qq_chat_type="group", user_id=member, chat_type="group",
+            event_options={"reply_expected": True, "channel_context": (
+                "[QQ 平台路由] 当前消息已可信 @ 本机器人；即使同时 @ 其他人或机器人，"
+                "本机器人也是对话对象，应正常处理并回答，不能因其他 @ 而静默。"
+                if (isinstance(mentions, list) and len(mentions) > 1) or "<@" in text else None)})
+
+    async def _handle_plain_group_message(self, d, msg_id, content, author, timestamp) -> bool | None:
+        """GROUP_MESSAGE_CREATE: plain (non-@) group chat. If the bot is @mentioned,
+        treat it as an @message; otherwise cache it as group context so a later
+        @bot still sees the preceding conversation."""
+        group_openid = str(d.get("group_openid", ""))
+        member = str(author.get("member_openid", ""))
+        if not group_openid or not self._is_group_allowed(group_openid, member):
+            return
+        if self._is_at_bot(d):
+            await self._handle_group_message(d, msg_id, content, author, timestamp)
+            return
+        if self._group_reply_gate.enabled(group_openid) or d.get('attachments'):
+            from .group_history import handle_unmentioned
+            try:
+                with self._group_images.tracking(group_openid, d.get("attachments")):
+                    return await handle_unmentioned(self, d, msg_id, content, author, timestamp)
+            except Exception:
+                logger.exception("[%s] Non-mention intake failed: group=%s message=%s",
+                                 self._log_tag, group_openid, msg_id)
+            return
+        # Unconfigured groups do not retain passive chat, including memory windows.
+        return
 
     async def _handle_guild_message(self, d, msg_id, content, author, timestamp) -> None:
         channel_id = str(d.get("channel_id", ""))
@@ -799,9 +969,104 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             d, msg_id, content, d.get("attachments"), timestamp,
             chat_id=guild_id, qq_chat_type="dm", user_id=author_id, chat_type="dm")
 
+    async def prepare_group_turn_history(self, async_store, session_id, event):
+        """Plugin-owned replay seam, independent of the loader namespace."""
+        from .group_history import prepare_turn_history
+        return await prepare_turn_history(async_store, session_id, event)
+
+    # ── Group transcript + speaker identity (local patch) ──
+
+    @staticmethod
+    def _strip_speaker_tag_echo(text: str) -> str:
+        """Local patch: strip a leading ``[群聊-管理员]``/``[群聊-群友-X]`` tag the model
+        mirrors from the injected group-context format onto its own reply."""
+        return re.sub(r"^[ \t]*\[群聊-(?:管理员|群友-[^\]]*)\][ \t]*", "", text or "", count=1)
+
+    # The display wraps a reply as "💭 **推理：**\n```\n<reasoning>\n```\n\n<answer>"
+    # when reasoning display is on (gateway/run_turn.py). Inner fences are escaped
+    # to \`\`\` by escape_code_fences_for_display, so a non-greedy match to the first
+    # closing fence is safe.
+    _REASONING_BLOCK_RE = re.compile(
+        r"^\s*💭\s*\*\*(?:推理|Reasoning)[:：]\*\*\r?\n```[^\n]*\r?\n.*?\r?\n```[ \t]*\r?\n+",
+        re.DOTALL,
+    )
+
+    @classmethod
+    def _strip_reasoning_block(cls, text: str) -> str:
+        """Local patch: record only the answer in the group transcript — the reasoning
+        block is display-only and would otherwise be re-injected as context next turn."""
+        return cls._REASONING_BLOCK_RE.sub("", text or "", count=1)
+
+    def _record_group_turn(self, group_openid: str, label: str, text: str) -> None:
+        """Append one line to a group's rolling transcript (inbound or outbound)."""
+        if not group_openid or not text or not text.strip():
+            return
+        cache = self._group_context_cache.setdefault(group_openid, [])
+        cache.append((label, text.strip()))
+        if len(cache) > self._group_context_max:
+            del cache[: len(cache) - self._group_context_max]
+
+    def _render_group_context(self, group_openid: str, consume: bool = True) -> list[str]:
+        """Render the stored transcript as injectable lines; ``consume=True`` drains it."""
+        cache = self._group_context_cache.get(group_openid) or []
+        if not cache:
+            return []
+        lines = ["[群聊上下文-最近对话]"]
+        for label, msg_text in cache:
+            lines.append(f"[群聊上下文-{label}] {msg_text}")
+        lines.append("[/群聊上下文]")
+        lines.append("")
+        if consume:
+            # Drained — these entries have been delivered to the model.
+            self._group_context_cache[group_openid] = []
+        return lines
+
+    def _is_at_bot(self, d: dict[str, Any]) -> bool:
+        """Use a self-marked mention or explicitly configured group bot identity."""
+        bot_id = str(self.config.extra.get("bot_member_openid") or "")
+        mentions = d.get("mentions")
+        if isinstance(mentions, list):
+            for m in mentions:
+                if isinstance(m, dict) and (m.get("is_you") is True
+                        or (bot_id and str(m.get("id") or "") == bot_id)):
+                    return True
+        if bot_id:
+            from .group_identity import strip_bot_invocation
+            content = str(d.get("content") or "").strip()
+            return strip_bot_invocation(content, {bot_id}) != content
+        return False
+
+    def _is_master(self, user_id: str, author: Optional[dict[str, Any]] = None) -> bool:
+        """Only the canonical routing sender establishes administrator identity."""
+        return bool(self._home_channel and user_id and user_id == self._home_channel)
+
+    def _speaker_label(self, user_id: str, author: Optional[dict[str, Any]] = None) -> str:
+        """Human-readable label for a group speaker (master vs 群友-<short>)."""
+        if self._is_master(user_id, author):
+            return "管理员"
+        short = user_id[:6] if len(user_id) >= 6 else user_id
+        return f"群友-{short}"
+
+    @staticmethod
+    def _normalize_panel_command(text: str) -> str:
+        """Strip the '/' QQ's command panel prepends to non-ASCII panel entries.
+
+        Hermes built-in and skill commands are printable-ASCII, so a leading
+        slash followed by a non-ASCII token is always a panel entry — demote it
+        to normal chat so the gateway doesn't answer "Unknown command".
+        """
+        stripped = text.lstrip()
+        if not stripped.startswith("/") or len(stripped) < 2:
+            return text
+        first_token = stripped[1:].split(maxsplit=1)[0] if stripped[1:].split() else ""
+        if first_token and all(0x21 <= ord(ch) < 0x7F for ch in first_token):
+            return text  # ASCII command (/help, /model, /fast…) — leave for gateway
+        return stripped[1:].rstrip() or text
+
     _INBOUND_HANDLERS = {
         "C2C_MESSAGE_CREATE": "_handle_c2c_message",
         "GROUP_AT_MESSAGE_CREATE": "_handle_group_message",
+        "GROUP_MESSAGE_CREATE": "_handle_plain_group_message",
         "GUILD_MESSAGE_CREATE": "_handle_guild_message",
         "GUILD_AT_MESSAGE_CREATE": "_handle_guild_message",
         "DIRECT_MESSAGE_CREATE": "_handle_dm_message"}
@@ -815,7 +1080,8 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     async def _ingest(
         self, d: dict[str, Any], msg_id: str, content: str, attachments: Any, timestamp: str, *,
-        chat_id: str, qq_chat_type: str, verbose: bool = False, **source_kwargs: Any) -> None:
+        chat_id: str, qq_chat_type: str, verbose: bool = False,
+        event_options: Optional[dict[str, Any]] = None, **source_kwargs: Any) -> None:
         """Shared inbound tail: fold attachment transcripts/file info and quoted context
         into the text, drop empty events, remember the QQ chat kind and dispatch."""
         att = await self._process_attachments(attachments)
@@ -842,8 +1108,22 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             source=self.build_source(chat_id=chat_id,** source_kwargs), text=text,
             message_type=self._detect_message_type(image_urls, image_media_types), raw_message=d,
             message_id=msg_id, media_urls=image_urls, media_types=image_media_types,
+            media_text_inlined=[False] * len(image_urls),
             timestamp=self._parse_qq_timestamp(timestamp),
+            **(event_options or {}),
         )
+        from .delivery_binding import quoted_message_id
+        from gateway.inbound_attachment_proofs import record_attachment
+        event._inbound_attachment_receipts = []
+        for index, (path, mime) in enumerate(zip(att["image_urls"], att["image_media_types"])):
+            receipt = record_attachment(event, path, mime)
+            if receipt:
+                event._inbound_attachment_receipts.append((receipt, index))
+        event.reply_to_message_id = quoted_message_id(d)
+        _capture_meme_turn(event)
+        if qq_chat_type == "group":
+            from gateway.platforms.base import resolve_channel_prompt
+            event.channel_prompt = event.channel_prompt or resolve_channel_prompt(self.config.extra, chat_id)
         await self.handle_message(event)
 
     # ── Quoted-message handling ──
@@ -916,13 +1196,14 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         voice_transcripts: list[str] = []
         other_attachments: list[str] = []
 
-        for att in attachments if isinstance(attachments, list) else ():
+        for att in attachments[:4] if isinstance(attachments, list) else ():
             if not isinstance(att, dict):
                 continue
             ct = str(att.get("content_type", "")).strip().lower()
             url = str(att.get("url", "")).strip()
             filename = str(att.get("filename", ""))
             if not url:
+                other_attachments.append("[附件不可用：平台事件未提供下载 URL]")
                 continue
             if url.startswith("//"):
                 url = f"https:{url}"
@@ -944,7 +1225,7 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
             is_image = ct.startswith("image/")
             try:
-                cached_path = await self._download_and_cache(url, ct, filename)
+                cached_path = await self._download_and_cache(url, ct, filename, max_bytes=32 * 1024 * 1024)
             except Exception as exc:
                 logger.debug("[%s] Failed to cache %s: %s", self._log_tag, "image" if is_image else "attachment", exc)
                 continue
@@ -952,7 +1233,9 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 continue
             if not is_image:
                 label = "video" if ct.startswith("video/") else "file"
-                other_attachments.append(f"[{label}: {filename or ct} ({cached_path})]")
+                other_attachments.append(f"[{label}: {filename or ct}；附件引用将在本回合提供]")
+                image_urls.append(cached_path)
+                image_media_types.append(ct if '/' in ct else "application/octet-stream")
             elif os.path.isfile(cached_path):
                 image_urls.append(cached_path)
                 image_media_types.append(ct or "image/jpeg")
@@ -969,7 +1252,9 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     def _opt_str(value: Any) -> Optional[str]:
         return (value.strip() if isinstance(value, str) else "") or None
 
-    async def _download_and_cache(self, url: str, content_type: str, original_name: str = "") -> Optional[str]:
+    async def _download_and_cache(
+        self, url: str, content_type: str, original_name: str = "", *, max_bytes: Optional[int] = None,
+    ) -> Optional[str]:
         """Download a URL and cache it locally (``original_name`` falls back to the URL basename)."""
         from tools.url_safety import is_safe_url
 
@@ -978,9 +1263,24 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if not self._http_client:
             return None
         try:
-            resp = await self._http_client.get(url, timeout=30.0, headers=self._qq_media_headers())
-            resp.raise_for_status()
-            data = resp.content
+            if max_bytes is None:
+                resp = await self._http_client.get(url, timeout=30.0, headers=self._qq_media_headers())
+                resp.raise_for_status()
+                data = resp.content
+            else:
+                # Quiet background images must not buffer an arbitrarily large
+                # response. Enforce the cap even without a Content-Length header.
+                async with self._http_client.stream(
+                    "GET", url, timeout=30.0, headers=self._qq_media_headers(),
+                ) as resp:
+                    resp.raise_for_status()
+                    chunks, size = [], 0
+                    async for chunk in resp.aiter_bytes():
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise ValueError("background image exceeds size limit")
+                        chunks.append(chunk)
+                    data = b"".join(chunks)
         except Exception as exc:
             logger.debug("[%s] Download failed for %s: %s", self._log_tag, url[:80], exc)
             return None
@@ -1293,9 +1593,17 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         headers = await self._auth_headers()
         try:
             resp = await client.request(method, f"{API_BASE}{path}", headers=headers, json=body, timeout=timeout)
-            data = resp.json()
+            if method.upper() == "DELETE" and resp.status_code == 200 and not resp.content:
+                return {}
             if resp.status_code >= 400:
-                raise RuntimeError(f"QQ Bot API error [{resp.status_code}] {path}: {data.get('message', data)}")
+                from .receipt_adapter import QQAPIRejection
+                raise QQAPIRejection(f"QQ Bot API error [{resp.status_code}]")
+            data = resp.json()
+            if not isinstance(data, dict):
+                raise RuntimeError("QQ Bot API returned a non-object response")
+            if data.get("code") not in (None, 0, "0"):
+                from .receipt_adapter import QQAPIRejection
+                raise QQAPIRejection("QQ Bot API returned a business error")
             return data
         except httpx.TimeoutException as exc:
             raise RuntimeError(f"QQ Bot API timeout [{path}]: {exc}") from exc
@@ -1352,11 +1660,15 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         """True when connected now or after waiting for the listener to reconnect."""
         return self.is_connected or await self._wait_for_reconnection()
 
-    async def send(
+
+
+    async def _send_text_impl(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
         """Send text/markdown: format, split via truncate_message(), retry transient failures."""
         del metadata
+        # Local patch: never let the model's mirrored "[群聊-管理员]" tag reach the wire.
+        content = self._strip_speaker_tag_echo(content)
         if not await self._ensure_connected():
             return self._NOT_CONNECTED
         if not content or not content.strip():
@@ -1364,36 +1676,48 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
         chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH)
         last_result = SendResult(success=False, error="No chunks")
+        returned_ids = []
         for chunk in chunks:
             last_result = await self._send_chunk(chat_id, chunk, reply_to)
             if not last_result.success:
-                return last_result
+                break
+            if last_result.message_id:
+                returned_ids.append(last_result.message_id)
             reply_to = None  # only reply_to the first chunk
+        last_result.continuation_message_ids = tuple(returned_ids[:-1] if last_result.message_id else returned_ids)
+        # Local patch: record our own reply in the group's rolling transcript, so
+        # the next @message in this group sees the full exchange rather than a
+        # cold start. QQ never pushes plain group messages, so our outbound turns
+        # are the only bridge between two consecutive @messages.
+        if last_result.success and chat_id in self._group_context_cache:
+            # Drop the display-only reasoning block, then keep the entry short.
+            recorded = self._strip_reasoning_block(self.format_message(content)).strip()
+            if len(recorded) > 300:
+                recorded = recorded[:300] + "…"
+            if recorded:
+                self._record_group_turn(chat_id, self._assistant_label, recorded)
         return last_result
 
     _PERMANENT_SEND_ERRORS = ("invalid", "forbidden", "not found")
 
+    def _send_retry_is_final(self, result: SendResult) -> bool:
+        """Journaled refusals/unknown outcomes must not re-enter the plain-text fallback."""
+        raw = result.raw_response
+        return isinstance(raw, dict) and raw.get("delivery_status") in {"error", "unknown"}
+
     async def _send_chunk(self, chat_id: str, content: str, reply_to: Optional[str] = None) -> SendResult:
-        last_exc: Optional[Exception] = None
         sender = self._text_sender(self._guess_chat_type(chat_id))
         if sender is None:
             return SendResult(success=False, error=f"Unknown chat type for {chat_id}")
-        for attempt in range(3):
-            try:
-                return await sender(chat_id, content, reply_to)
-            except Exception as exc:
-                last_exc = exc
-                if any(k in str(exc).lower() for k in self._PERMANENT_SEND_ERRORS + ("bad request",)):
-                    break  # permanent — don't retry
-                if attempt < 2:
-                    delay = 1.0 * (2 ** attempt)
-                    logger.warning("[%s] send retry %d/3 after %.1fs: %s", self._log_tag, attempt + 1, delay, exc)
-                    await asyncio.sleep(delay)
-
-        error_msg = (str(last_exc) or type(last_exc).__name__) if last_exc else "Unknown error"
-        logger.error("[%s] Send failed: %s", self._log_tag, error_msg)
-        retryable = not any(k in error_msg.lower() for k in self._PERMANENT_SEND_ERRORS)
-        return SendResult(success=False, error=error_msg, retryable=retryable)
+        try:
+            return await sender(chat_id, content, reply_to)
+        except Exception as exc:
+            from .delivery_binding import current_delivery
+            from .receipt_adapter import QQAPIRejection
+            status = "error" if isinstance(exc, QQAPIRejection) else "unknown"
+            return SendResult(success=False, error=f"QQ send {status}: {type(exc).__name__}", retryable=False,
+                              raw_response={"qq_logical_id": current_delivery(chat_id).logical_id,
+                                            "delivery_status": status})
 
     @staticmethod
     def _rest_path(chat_type: str, target_id: str, endpoint: str) -> str:
@@ -1407,8 +1731,17 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     async def _post_message(self, path: str, body: dict[str, Any]) -> SendResult:
         """POST a message body and wrap the response as a successful SendResult."""
-        data = await self._api_request("POST", path, body)
-        return SendResult(success=True, message_id=str(data.get("id", uuid.uuid4().hex[:12])), raw_response=data)
+        from .receipt_adapter import recorded_post, receipt_metadata
+        _, receipt = await recorded_post(self, API_BASE, path, body)
+        return SendResult(success=True, message_id=receipt.message_id,
+                          raw_response={"qq_receipt": receipt_metadata(receipt)})
+
+    async def recall_own_group_message(self, *, logical_id: str, group_id: str,
+                                       message_id: str, retry_unknown: bool = False):
+        """Trusted-call API only; caller authorizes the action before invoking."""
+        from .receipt_adapter import recall_message
+        return await recall_message(self, API_BASE, logical_id=logical_id, group_id=group_id,
+                                    message_id=message_id, retry_unknown=retry_unknown)
 
     async def _send_text_to(
         self, chat_type: str, target_id: str, content: str, reply_to: Optional[str] = None,
@@ -1469,7 +1802,8 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         """Send a 3-button approval request (allow-once / allow-always / deny);
         clicks come back as INTERACTION_CREATE decoded by parse_approval_button_data."""
         from .keyboards import build_approval_text
-        keyboard = build_approval_keyboard(req.session_key, allow_permanent=getattr(req, "allow_permanent", True))
+        keyboard = build_approval_keyboard(req.session_key, allow_permanent=getattr(req, "allow_permanent", True),
+                                           request_id=req.request_id)
         return await self.send_with_keyboard(chat_id, build_approval_text(req), keyboard, reply_to=reply_to)
 
     # Cross-adapter gateway contract: gateway/run.py detects send_exec_approval /
@@ -1482,11 +1816,20 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         _default_interaction_dispatch. QQ's 3-button keyboard has no session tier and no thread /
         DM targeting, so only the ``always`` choice and the raw command/reason are used."""
         description = prompt.description
+        from gateway.request_security import policy_for_adapter
+        parsed = self._parse_gateway_session_key(prompt.session_key) or {}
+        source = self.build_source(chat_id=prompt.chat_id, chat_type=parsed.get("chat_type", ""))
+        restricted = policy_for_adapter(self, source) is not None
+        # Identity must come from the original request, never a snapshot of the current queue.
+        request_id = prompt.request_id
+        if restricted and not request_id:
+            return SendResult(success=False, error="Approval request identity unavailable")
         if prompt.smart_denied:
             description += " Owner override applies to this one operation only."
         req = ApprovalRequest(
             session_key=prompt.session_key, title="Execute this command?", description=description,
             command_preview=prompt.command, timeout_sec=self._APPROVAL_TIMEOUT_SECONDS,
+            request_id=request_id,
             allow_permanent="always" in prompt.choices)
         # QQ requires a msg_id for passive replies; the last inbound id is the natural one.
         return await self.send_approval_request(
@@ -1500,8 +1843,22 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         del session_key, metadata  # present for contract parity only.
         default_hint = f" (default: {default})" if default else ""
         content = f"☤ **Update Needs Your Input**\n\n{prompt}{default_hint}"
+        keyboard = build_update_prompt_keyboard()
+        from gateway.request_security import policy_for_adapter
+        source = self.build_source(chat_id=chat_id, chat_type=self._guess_chat_type(chat_id))
+        if policy_for_adapter(self, source) is not None:
+            import secrets
+            token = secrets.token_hex(16)
+            cards = getattr(self, "_role_update_cards", None)
+            if cards is None:
+                cards = self._role_update_cards = {}
+            cards[chat_id] = token
+            for row in keyboard.content.rows:
+                for button in row.buttons:
+                    answer = parse_update_prompt_button_data(button.action.data)
+                    button.action.data = f"update-request:{token}:{answer}"
         return await self.send_with_keyboard(
-            chat_id, content, build_update_prompt_keyboard(), reply_to=self._last_msg_id.get(chat_id)
+            chat_id, content, keyboard, reply_to=self._last_msg_id.get(chat_id)
         )
 
     def _build_text_body(self, content: str, reply_to: Optional[str] = None) -> dict[str, Any]:
@@ -1549,6 +1906,17 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         """Upload media and send as a native message. HTTP(S) URLs → single ``POST
         .../files`` with ``url=`` (QQ fetches it). Local files → chunked upload
         (prepare / PUT parts / complete), up to the platform's ~100 MB per-file limit."""
+        from agent.request_security import current_policy
+        policy = current_policy()
+        if policy is None:
+            from gateway.request_security import policy_for_adapter
+            policy = policy_for_adapter(self, self.build_source(
+                chat_id=chat_id, chat_type=self._guess_chat_type(chat_id)))
+        if policy is not None:
+            if not policy.is_admin and (policy.platform != "qqbot" or policy.chat_id != chat_id):
+                return SendResult(success=False, error="Request policy denied attachment destination")
+            if not policy.allows_media(media_source):
+                return SendResult(success=False, error="Request policy denied attachment")
         if not await self._ensure_connected():
             return self._NOT_CONNECTED
         chat_type = self._guess_chat_type(chat_id)
@@ -1637,8 +2005,8 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     # ── Format / chat info / helpers ──
 
     def format_message(self, content: str) -> str:
-        """Pass markdown through when supported, else strip it (as BlueBubbles/SMS do)."""
-        return content if self._markdown_support else strip_markdown(content)
+        """Repair QQ bold punctuation boundaries, or strip markup in plain-text mode."""
+        return normalize_qq_markdown(content) if self._markdown_support else strip_markdown(content)
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         chat_type = self._guess_chat_type(chat_id)
@@ -1654,7 +2022,18 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     @staticmethod
     def _strip_at_mention(content: str) -> str:
-        return re.sub(r"^@\S+\s*", "", content.strip())
+        # Local patch: QQ @-messages arrive as "<@openid> text" (or "<@!openid>"),
+        # sometimes "@name text", and can carry several leading mentions
+        # ("@a @b /new"). Strip every leading mention token so a bare "/command"
+        # survives for the gateway's is_command() check.
+        stripped = content.strip()
+        pattern = re.compile(r"^(?:<@!?\S+>|@\S+)\s*")
+        while True:
+            new = pattern.sub("", stripped, count=1)
+            if new == stripped:
+                break
+            stripped = new
+        return stripped
 
     def _entry_matches(self, entries: list[str], target: str) -> bool:
         normalized_target = str(target).strip().lower()

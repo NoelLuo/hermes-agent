@@ -13,6 +13,7 @@ import pytest
 
 from gateway.config import Platform
 from gateway.platform_registry import PlatformEntry, platform_registry
+from gateway.run import GatewayRunner  # bootstrap before per-test real-home I/O protection
 from tools.send_message_tool import resolve_send_target, send_message_tool
 
 

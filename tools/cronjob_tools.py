@@ -1085,6 +1085,22 @@ def cronjob(
     del a["task_id"]  # unused but kept for handler signature compatibility
     try:
         normalized = (action or "").strip().lower()
+        from agent.request_security import current_policy
+        policy = current_policy()
+        if policy is not None and policy.platform == "qqbot" and not policy.is_admin:
+            if not policy.allows_tool("cronjob_manage", {"action": "create"}) or normalized != "create":
+                return tool_error("Public callers may only create source-chat reminders", success=False)
+            from cron.jobs import _PUBLIC_CRON_FORBIDDEN
+            if any(a.get(field) for field in _PUBLIC_CRON_FORBIDDEN):
+                return tool_error("Public cron forbids execution, context and provider overrides", success=False)
+            target = f"{policy.platform}:{policy.chat_id}"
+            if a["deliver"] not in (None, "origin", target) or a["failure_deliver"] not in (None, target):
+                return tool_error("Public cron must deliver only to the source chat", success=False)
+            if a["enabled_toolsets"] not in (None, [], ["web"]):
+                return tool_error("Public cron cannot select privileged toolsets", success=False)
+            a["deliver"] = target
+            a["failure_deliver"] = target
+            a["enabled_toolsets"] = ["web"] if a["enabled_toolsets"] is None else a["enabled_toolsets"]
         handler = _JOBLESS_ACTIONS.get(normalized)
         if handler is not None:
             return handler(a)
@@ -1247,6 +1263,14 @@ _HANDLER_FORWARDED_ARGS = (
 def _cronjob_handler(args, **kw):
     """Model-tool dispatch: resolves the one model-facing ``monitor`` field into the stored
     ``monitor_script``/``monitor_url`` pair (legacy field names still accepted)."""
+    from agent.request_security import current_policy
+    policy = current_policy()
+    if {"public_context_only", "public_context_author", "request_policy", "metadata", "policy"}.intersection(args):
+        return tool_error("Cron policy metadata is assigned by the trusted creation context", success=False)
+    if policy is not None and policy.platform == "qqbot" and not policy.is_admin:
+        forbidden = {"request_policy", "metadata", "policy", "api_key", "base_url", "provider", "model"}
+        if forbidden.intersection(args):
+            return tool_error("Public cron cannot supply policy metadata or provider credentials", success=False)
     _mon_script, _mon_url = _split_monitor_arg(args.get("monitor"), args.get("monitor_script"), args.get("monitor_url"))
     return cronjob(
         action=args.get("action", ""),

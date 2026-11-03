@@ -235,6 +235,17 @@ class GatewayConfigLoadersMixin:
         if (policy := local_policy(self, source)) is not None:
             # A local session runs its frozen (or followed) level, not the profile's.
             return policy.current_reasoning_config(self, resolved_session_key)
+        # Local patch: session overrides still win; QQ can use its own effort.
+        if source is not None:
+            from hermes_constants import parse_reasoning_effort
+            from gateway.run import _load_gateway_config, _platform_config_key
+            effort = cfg_get(
+                _load_gateway_config(), "agent", "platforms", _platform_config_key(source.platform),
+                "reasoning_effort", default="",
+            )
+            parsed = parse_reasoning_effort(effort)
+            if parsed is not None:
+                return parsed
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(self, session_key: str, reasoning_config: Optional[dict]) -> None:

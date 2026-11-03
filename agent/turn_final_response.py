@@ -176,6 +176,13 @@ def finish_text_response(
     # empty-response warnings on the final response path.
     agent._mute_post_response = False
 
+    # A trusted addressed turn cannot finish with a silence control token. Retry
+    # inside this same tool loop, preserving completed tool work and cached history.
+    from agent.required_reply import recover_required_reply
+    if recover_required_reply(final_response, messages):
+        final_response = None
+        return _verdict("continue")
+
     # Think-block-only / empty content: recovery path.
     if not agent._has_content_after_think_block(final_response):
         _ev = recover_empty_response(

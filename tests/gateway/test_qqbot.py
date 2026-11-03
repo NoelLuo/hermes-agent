@@ -200,7 +200,8 @@ class TestQQWebSocketProxy:
         with mock.patch("plugins.platforms.qqbot.adapter.aiohttp.ClientSession", side_effect=FakeSession):
             await adapter._open_ws("wss://api.sgroup.qq.com/websocket")
 
-        assert seen_session_kwargs.get("trust_env") is True
+        # Proxy selection is explicit so the direct fallback cannot reuse env proxies.
+        assert seen_session_kwargs.get("trust_env") is False
         assert seen_ws_kwargs.get("proxy") == "http://127.0.0.1:7897"
 
 # ---------------------------------------------------------------------------
@@ -1127,7 +1128,7 @@ class TestIdentifyIntents:
 
         # Verify all expected intent bits are present
         assert intents & (1 << 25), "GROUP_MESSAGES (1<<25) missing"
-        assert intents & (1 << 30), "GUILD_AT_MESSAGE (1<<30) missing"
+        assert not intents & (1 << 30), "Unauthorized PUBLIC_GUILD_MESSAGES must not be requested"
         assert intents & (1 << 12), "DIRECT_MESSAGES (1<<12) missing"
         assert intents & (1 << 26), "INTERACTION (1<<26) missing"
 
@@ -1137,7 +1138,7 @@ class TestIdentifyIntents:
 # ---------------------------------------------------------------------------
 
 class TestProcessAttachmentsPathExposure:
-    """Verify that video and file attachments include the cached local path."""
+    """File paths remain typed media, not unverified prose pretending to be a grant."""
 
     def _make_adapter(self):
         from plugins.platforms.qqbot.adapter import QQAdapter
@@ -1148,7 +1149,8 @@ class TestProcessAttachmentsPathExposure:
         adapter = self._make_adapter()
 
         # Mock _download_and_cache to return a known path
-        async def fake_download(url, ct, original_name=""):
+        async def fake_download(url, ct, original_name="", *, max_bytes=None):
+            assert max_bytes == 32 * 1024 * 1024
             return "/tmp/cache/video_abc123.mp4"
 
         adapter._download_and_cache = fake_download  # type: ignore[assignment]
@@ -1162,11 +1164,13 @@ class TestProcessAttachmentsPathExposure:
         ]
         result = await adapter._process_attachments(attachments)
 
-        assert result["image_urls"] == []
+        assert result["image_urls"] == ["/tmp/cache/video_abc123.mp4"]
+        assert result["image_media_types"] == ["video/mp4"]
         assert result["voice_transcripts"] == []
         info = result["attachment_info"]
         assert "my_video.mp4" in info
-        assert "/tmp/cache/video_abc123.mp4" in info
+        assert "/tmp/cache/video_abc123.mp4" not in info
+        assert "附件引用将在本回合提供" in info
 
 
 

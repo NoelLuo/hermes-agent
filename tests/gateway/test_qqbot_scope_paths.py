@@ -29,6 +29,8 @@ import pytest
 from agent import secret_scope as ss
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.session import SessionSource
+# Bootstrap must run during collection, before the real-home I/O guard is armed.
+from gateway.run import GatewayRunner, _own_policy_open_startup_violation
 
 
 @pytest.fixture(autouse=True)

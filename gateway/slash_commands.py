@@ -1203,10 +1203,25 @@ class GatewaySlashCommandsMixin(
             return session_key, t(stale_key)
         return session_key, t(none_key)
 
+    def _request_approval_target(self, event):
+        from gateway.request_security import policy_for_source
+        policy = policy_for_source(self, event.source)
+        if policy is None:
+            return False, None
+        tokens = event.get_command_args().strip().split()
+        targets = [token[8:] for token in tokens if token.startswith("request:") and token[8:]]
+        return True, targets[0] if len(targets) == 1 and "all" not in tokens else None
+
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve — unblock waiting agent thread(s). They block inside tools/approval.py;
         signalling the event resumes them so the command executes inline (same flow as the CLI)."""
         from tools.approval import resolve_gateway_approval
+        denial = self._request_command_denial(event, "approve")
+        if denial is not None:
+            return denial
+        restricted, request_id = self._request_approval_target(event)
+        if restricted and not request_id:
+            return EphemeralReply("请点击对应审批按钮，或使用 /approve request:<请求ID>；不接受无目标或批量审批。")
         session_key, stale = self._blocking_approval_or_stale(event, "gateway.approval_expired",
                                                               "gateway.approve.no_pending")
         if stale:
@@ -1215,7 +1230,10 @@ class GatewaySlashCommandsMixin(
         args = event.get_command_args().strip().lower().split()
         choices = {_APPROVE_CHOICE_BY_ARG[a] for a in args if a in _APPROVE_CHOICE_BY_ARG}
         choice = "always" if "always" in choices else "session" if "session" in choices else "once"
-        count = resolve_gateway_approval(session_key, choice, resolve_all="all" in args)
+        if restricted:
+            count = resolve_gateway_approval(session_key, choice, request_id=request_id)
+        else:
+            count = resolve_gateway_approval(session_key, choice, resolve_all="all" in args)
         if not count:
             return t("gateway.approve.no_pending")
         confirmation_text = t(f"gateway.approve.{choice}_{'plural' if count > 1 else 'singular'}", count=count)
@@ -1230,6 +1248,12 @@ class GatewaySlashCommandsMixin(
         the agent so it can adapt instead of only hearing "denied". Ported from qwibitai/nanoclaw#2832.
         """
         from tools.approval import resolve_gateway_approval
+        denial = self._request_command_denial(event, "deny")
+        if denial is not None:
+            return denial
+        restricted, request_id = self._request_approval_target(event)
+        if restricted and not request_id:
+            return EphemeralReply("请点击对应审批按钮，或使用 /deny request:<请求ID>；不接受无目标或批量审批。")
         session_key, stale = self._blocking_approval_or_stale(event, "gateway.deny.stale",
                                                               "gateway.deny.no_pending")
         if stale:
@@ -1240,7 +1264,11 @@ class GatewaySlashCommandsMixin(
         tokens = raw_args.split()
         resolve_all = bool(tokens) and tokens[0].lower() == "all"
         reason = (raw_args[len(tokens[0]):].strip() if resolve_all else raw_args)[:280].strip()
-        count = resolve_gateway_approval(session_key, "deny", resolve_all=resolve_all, reason=reason or None)
+        if restricted:
+            reason = " ".join(token for token in tokens if not token.startswith("request:"))[:280].strip()
+            count = resolve_gateway_approval(session_key, "deny", request_id=request_id, reason=reason or None)
+        else:
+            count = resolve_gateway_approval(session_key, "deny", resolve_all=resolve_all, reason=reason or None)
         if not count:
             return t("gateway.deny.no_pending")
         logger.info("User denied %d dangerous command(s) via /deny%s", count,

@@ -67,6 +67,7 @@ async def admit_message(authority, event):
     # Only the delivery waiter is process-local; execution reads the committed snapshot.
     authority.native_waiters.add(receipt.admission_id)
     waiter = authority.waiters.setdefault(receipt.admission_id, asyncio.get_running_loop().create_future())
+    _registry(authority, 'export_delivery_waiters')[receipt.admission_id] = event
     adopters = _marker_adopters(authority)
     if getattr(event, '_turn_marker_handoff', False):
         # The adapter lifecycle that sends this reply releases the turn's crash marker only once
@@ -79,6 +80,7 @@ async def admit_message(authority, event):
     status = 'terminal' if row is None else row['status']  # None: deleted with its chat, nothing owed
     note_busy_admitted(event, receipt.admission_id, status, None if row is None else row.get('outcome'))
     if status in ('terminal', 'unknown'):
+        _registry(authority, 'export_delivery_waiters').pop(receipt.admission_id, None)
         authority.native_waiters.discard(receipt.admission_id)
         if authority.waiters.get(receipt.admission_id) is waiter:
             del authority.waiters[receipt.admission_id]
@@ -99,6 +101,7 @@ async def admit_message(authority, event):
             note_busy_parked(event)  # still queued (saved): answered after the pause, not dropped
         return pause_notice(authority, receipt.ref, exc.reason)
     finally:
+        _registry(authority, 'export_delivery_waiters').pop(receipt.admission_id, None)
         if adopters.get(receipt.admission_id) is event:
             del adopters[receipt.admission_id]
 
@@ -346,6 +349,12 @@ async def execute_admission(authority, ref, row):
                 event.allow_gateway_control = False
                 event.internal = True  # trust comes from the private binding and preclaim, never client JSON
             response = await authority.runner._handle_message(event)
+            waiting = _registry(authority, 'export_delivery_waiters').get(row['admission_id'])
+            if waiting is not None:
+                from gateway.guest_export_delivery import bridge_export_turn
+                from gateway.native_adapter_turns import bridge_adapter_turn
+                bridge_export_turn(event, waiting)
+                bridge_adapter_turn(authority.runner, event, waiting)
             result = captured.get('terminal_result', captured.get('result'))
             if result is None:
                 # No TurnRunner result means the handler answered without executing the turn.
@@ -464,9 +473,13 @@ async def deliver_settled(authority, admission_id):
     delivered = False
     try:
         with await _execution_scope(authority, home):
-            delivered = await deliver_response(adapter, event, session_key, response)
-    except Exception:
+            result = await deliver_response(adapter, event, session_key, response)
+            delivered = getattr(result, "success", bool(result))
+            return result
+    except Exception as exc:
         logger.exception('Delivery of settled admission %s failed', admission_id)
+        from gateway.platforms.base import SendResult
+        return SendResult(success=False, error=str(exc))
     finally:
         # Held until the send returns: an empty map means every settled reply was handed over.
         authority.pending_deliveries.pop(admission_id, None)
@@ -482,7 +495,8 @@ async def deliver_response(adapter, event, session_key, response):
     from gateway.platforms.base import _thread_metadata_for_event, _mark_notify_metadata
     text, ttl = adapter._unwrap_ephemeral(response)
     if not text:
-        return True
+        from gateway.platforms.base import SendResult
+        return SendResult(success=True)
     extracted = await adapter._extract_response_content(text, event, session_key, is_ephemeral_response=ttl > 0)
     metadata = _mark_notify_metadata(_thread_metadata_for_event(event))
     results = []
@@ -491,7 +505,9 @@ async def deliver_response(adapter, event, session_key, response):
                                        metadata, ttl > 0, ttl, results.append)
     await adapter._deliver_attachments(event, extracted, metadata, anything_sent=bool(results),
                                        record_delivery=results.append)
-    return any(getattr(result, 'success', False) for result in results if result is not None)
+    from gateway.platforms.base import SendResult
+    return next((result for result in results if result is not None and not result.success),
+                next((result for result in reversed(results) if result is not None), SendResult(success=True)))
 
 
 async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
@@ -516,6 +532,12 @@ async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
             response = await adapter._message_handler(event)
             # The ledgered send releases the marker off the event it sends.
             _move_marker(event, delivery_event)
+            from gateway.guest_export_delivery import bridge_export_turn
+            from gateway.native_adapter_turns import bridge_adapter_turn
+            from gateway.request_security import policy_for_adapter
+            policy_for_adapter(adapter, delivery_event.source)
+            bridge_export_turn(event, delivery_event)
+            bridge_adapter_turn(getattr(adapter, 'gateway_runner', None), event, delivery_event)
             delivery_event._turn_marker_handoff = event._turn_marker_handoff
             await deliver_response(adapter, delivery_event, session_key, response)
         except Exception as exc:

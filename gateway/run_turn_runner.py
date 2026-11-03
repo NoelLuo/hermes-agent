@@ -729,14 +729,17 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         cmd = _redact_approval_command(approval_data.get("command", ""))
         desc = _redact_approval_command(approval_data.get("description")) or ea_default_reason_text()
         flags = {k: approval_data.get(k, d) for k, d in (("allow_permanent", True), ("allow_session", True), ("smart_denied", False))}
+        request_id = approval_data.get("request_id")
+        request_id = request_id if isinstance(request_id, str) else ""
+        approval_sender = getattr(adapter, "send_exec_approval", None)
+        approval_identity = {"request_id": request_id} if callable(approval_sender) and _accepts_keyword(approval_sender, "request_id") else {}
         # Check the *class*, not the instance — MagicMock auto-creates attributes in tests.
         if _renders_exec_approval_buttons(type(adapter)):
             try:
                 fut = self._schedule(
                     adapter.send_exec_approval(
                         chat_id=ctx._status_chat_id, command=cmd, session_key=ctx.session_key or "",
-                        description=desc, metadata=ctx._status_thread_metadata,
-                        request_id=approval_data.get("request_id"), **flags,
+                        description=desc, metadata=ctx._status_thread_metadata, **flags, **approval_identity,
                     ),
                     "send_exec_approval scheduling error",
                 )
@@ -796,6 +799,13 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # Plain-text prompt with the adapter's typed prefix (e.g. `!approve`): typed "/" is blocked
         # in Slack threads and reserved by Matrix clients.
         msg = _format_exec_approval_fallback(cmd, desc, getattr(adapter, "typed_command_prefix", "/"), **flags)
+        from gateway.request_security import policy_for_source as requester_policy_for_source
+        if requester_policy_for_source(getattr(self, "_runner", None), getattr(ctx, "source", None)) is not None:
+            if not request_id:
+                raise RuntimeError("Approval request identity unavailable")
+            msg = (f"{desc}\n\n{cmd}\n\n"
+                   f"管理员可批准本次请求：/approve request:{request_id}\n"
+                   f"或拒绝本次请求：/deny request:{request_id}")
         try:
             # Mark as approval prompt: WeCom routes it through the control lane and Telegram pushes it
             # in "important" mode (#132516). Never ``notify`` — A2A reads that as the turn-final reply.
@@ -819,11 +829,14 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             _select_cached_agent_history,
         )
         ctx = self._ctx
+        from gateway.session_execution import public_conversation_history
+        request_policy = getattr(agent, "_request_security_policy", None)
+        public_context = request_policy is not None and request_policy.public_context
         from gateway.session_api_turn import api_execution
         api = api_execution.get()
         if api is not None and api['history'] is not None:
             from gateway.run import _collect_history_media_paths
-            history = api['history']
+            history = public_conversation_history(api['history']) if public_context else api['history']
             tail = history[-1] if history else None
             if api.get('resume_unanswered') and isinstance(tail, dict) and tail.get('role') == 'user':
                 # The door's re-run continues the row its failed attempt persisted (#115325). Only a
@@ -837,7 +850,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # sequences. Telegram observed=True rows are withheld from replayable history and attached to
         # the current addressed message as API-only context.
         agent_history, observed_group_context = _build_gateway_agent_history(
-            ctx.history, channel_prompt=ctx.channel_prompt, inject_timestamps=_message_timestamps_enabled(ctx.user_config),
+            public_conversation_history(ctx.history) if public_context else ctx.history,
+            channel_prompt=ctx.channel_prompt, inject_timestamps=_message_timestamps_enabled(ctx.user_config),
         )
         # FTS write-corruption guard: if persistence failed silently the reloaded transcript is stale
         # while the SAME cached agent still holds the live conversation (same-session amnesia). Only
@@ -864,9 +878,12 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 )
                 # The live history bypassed _build_gateway_agent_history's cleanup — re-apply
                 # the full canonicalization so no replay transform can slip through.
-                agent_history = canonicalize_replay_history(selected)
+                agent_history = canonicalize_replay_history(
+                    public_conversation_history(selected) if public_context else selected)
             else:
                 streaks.pop(ctx.session_key, None)
+        if public_context:
+            agent_history = public_conversation_history(agent_history)
         # MEDIA paths already in history are excluded from this turn's extraction (compression-safe).
         return agent_history, observed_group_context, _collect_history_media_paths(agent_history)
 
@@ -1023,7 +1040,11 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             captured = execution_result.get()
             before = (getattr(agent, 'session_prompt_tokens', 0) or 0,
                       getattr(agent, 'session_completion_tokens', 0) or 0)
-            with notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
+            from agent.required_reply import required_reply
+            from gateway.response_filters import is_intentional_silence_response, silence_allowed
+            silence_check = (is_intentional_silence_response if ctx.reply_expected is True
+                             and not silence_allowed(ctx.persist_user_display_kind, ctx.reply_expected) else None)
+            with required_reply(silence_check), notification_turn(agent, muted=ctx.mute_notification_reply, session_id=ctx.session_id or ""):
                 from gateway.response_filters import silence_allowed
                 # Where a bare marker would become the "needed a reply" warning, the agent ends a
                 # marker that follows a written reply on that reply, before transform/persistence.
@@ -1212,6 +1233,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         from gateway.session_policy import bind_turn_workspace, policy_for_source, policy_scope, refused_turn_result
         from gateway.session_api_turn import api_policy_scope
         from gateway.session_authorities import active_authority
+        from agent.request_security import policy_scope as requester_policy_scope
+        from gateway.request_security import policy_for_source as requester_policy_for_source
+        request_policy = requester_policy_for_source(self._runner, self._ctx.source)
+        from gateway.guest_export_delivery import export_turn_scope, pending_export_text
         from hermes_state_runtime import RuntimeStoreError
         policy = policy_for_source(self._runner, self._ctx.source)
         with ExitStack() as scope:
@@ -1222,9 +1247,14 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 if result is None:
                     raise
             else:
+                scope.enter_context(export_turn_scope(request_policy, self._ctx.source, getattr(self._ctx, "event_message_id", None)))
+                scope.enter_context(requester_policy_scope(request_policy))
                 scope.enter_context(api_policy_scope())
                 bind_turn_workspace(policy, self._ctx.session_id)
                 result = self._run_sync_scoped()
+                if request_policy is not None and request_policy._exports.records:
+                    result = {**result, "final_response": pending_export_text(result.get("final_response")),
+                              "response_previewed": False, "response_reused": False, "response_transformed": True}
             from gateway.session_results import execution_result
             captured = execution_result.get()
             if captured is not None:

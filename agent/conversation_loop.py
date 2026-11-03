@@ -805,6 +805,23 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     Mutates ``agent._cached_system_prompt`` and persists a freshly-built prompt on first
     build. Row states ``missing``/``null``/``empty``/``present`` are logged and DB
     failures log at WARNING so silent prefix-cache misses show in ``agent.log``."""
+    from agent.request_security import RequestSecurityPolicy
+
+    request_policy = getattr(agent, "_request_security_policy", None)
+    if isinstance(request_policy, RequestSecurityPolicy) and request_policy.public_context:
+        # A DB row has no trustworthy context provenance: neither its prompt nor
+        # pinned schemas may be carried from an older private session into public.
+        # Freeze the isolated build on this agent for all model rounds.
+        policy_key = request_policy.cache_key()
+        if getattr(agent, "_public_system_prompt_policy_key", None) != policy_key:
+            agent._cached_system_prompt = agent._build_system_prompt(system_message)
+            agent._public_system_prompt_policy_key = policy_key
+            _persist_system_prompt(
+                agent, "Session DB update_system_prompt failed for public session %s: %s.",
+                persist_tools=True,
+            )
+        return
+
     stored_prompt = None
     stored_state = "missing"
     session_row = None

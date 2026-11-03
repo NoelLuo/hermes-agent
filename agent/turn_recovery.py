@@ -1763,6 +1763,9 @@ def activate_codex_app_server_fallback(agent: Any, result: dict[str, Any]) -> bo
     Classify that text; on a billing / rate-limit verdict activate the configured fallback and
     return True so the caller re-runs the same user turn on the generic loop."""
     error = result.get("error")
+    from agent.fallback_policy import fallback_allowed, activate_for_error
+    if not fallback_allowed(error):
+        return False
     if not error or result.get("interrupted") or not agent._has_pending_fallback():
         return False
     classified = classify_api_error(
@@ -1772,7 +1775,7 @@ def activate_codex_app_server_fallback(agent: Any, result: dict[str, Any]) -> bo
         return False
     agent._buffer_diagnostic_status(
         _eager_fallback_status(classified, classified.reason == FailoverReason.upstream_rate_limit, False))
-    return bool(agent._try_activate_fallback(reason=classified.reason))
+    return bool(activate_for_error(agent, error, reason=classified.reason))
 
 
 def _is_genuine_nous_rate_limit(agent: Any, api_error: Exception, error_context: Any, classified: Any = None) -> bool:
@@ -1936,7 +1939,8 @@ def route_classified_error(
     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
     if _is_zai_coding_overload:
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
-    _should_fallback = (
+    from agent.fallback_policy import fallback_allowed, activate_for_error
+    _should_fallback = fallback_allowed(api_error) and (
         (is_rate_limited and _wrapped_output_cap_budget is None)
         or (_is_transport_failure and retry_count >= 2)
     ) and not (getattr(classified, "error_context", None) or {}).get("usage_window")  # never switch models on a plan limit
@@ -1951,13 +1955,14 @@ def route_classified_error(
         if not pool_may_recover:
             agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
-            if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
+            if activate_for_error(agent, api_error, reason=classified.reason, reset_at=reset_at):
                 return _fallback_break()
 
     # A 401/403 surviving credential refresh means a broken credential or endpoint:
     # escalate to the fallback chain once; False -> terminal handling.
     if (
         classified.is_auth
+        and fallback_allowed(api_error)
         and not _retry.auth_failover_attempted
         and agent._fallback_index < len(agent._fallback_chain)
     ):
@@ -1966,7 +1971,7 @@ def route_classified_error(
             "🔐 Authentication failed and could not be refreshed — "
             "switching to fallback provider..."
         )
-        if agent._try_activate_fallback(reason=classified.reason):
+        if activate_for_error(agent, api_error, reason=classified.reason):
             return _fallback_break()
 
     # Nous Portal: a genuine account-level 429 is recorded to a shared file so ALL

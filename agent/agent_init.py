@@ -1032,9 +1032,17 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     agent._configured_disabled_toolsets, disabled_toolsets = disabled_toolsets, session_disabled_toolsets(
         disabled_toolsets, getattr(agent, "platform", None), oneshot=agent_is_oneshot(agent))  # pin restore reads both
     agent.disabled_toolsets = disabled_toolsets  # so the tool_search bridge and delegate children drop them too
+    request_policy = getattr(agent, "_request_security_policy", None)
+    # A restricted requester cannot use the broad discovery bridge. Keep the
+    # selected, permitted public schemas eager (including deferred cron/plugins),
+    # rather than advertising tool_search and rejecting it at execution time.
+    public_surface = {"skip_tool_search_assembly": True} if request_policy is not None and not request_policy.is_admin else {}
     agent._tool_snapshot_selection = tool_selection_key(enabled_toolsets, disabled_toolsets)  # tools[] freeze gate
     agent.tools = agent_tool_surface(agent, model_tools.get_tool_definitions(
-        enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets, quiet_mode=agent.quiet_mode) or [])
+        enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets, quiet_mode=agent.quiet_mode, **public_surface) or [])
+    request_policy = getattr(agent, "_request_security_policy", None)
+    if request_policy is not None and not request_policy.is_admin:
+        agent.tools = [tool for tool in agent.tools if tool["function"]["name"] in request_policy.allowed_tools]
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()
     # Kanban guidance is session-static for the dispatcher-owned worker only. Profiles may
     # expose kanban_show interactively, and children/cron runs inherit the env var, without
@@ -1217,7 +1225,9 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
     agent._iters_since_skill = 0
     from agent.safe_worker_policy import safe_worker_enabled
 
-    if safe_worker_enabled():
+    from agent.request_security import current_policy
+    request_policy = getattr(agent, "_request_security_policy", None) or current_policy()
+    if safe_worker_enabled() or (request_policy is not None and request_policy.public_context):
         agent._memory_manager = None
         return
     # skip_memory skips the external *provider*; enabled_toolsets=["memory"] still gets the
@@ -1871,7 +1881,9 @@ def _compressor_max_tokens(agent):
 
 
 def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db):
-    _selected_engine = _select_context_engine(_agent_cfg)
+    request_policy = getattr(agent, "_request_security_policy", None)
+    _selected_engine = (None if request_policy is not None and request_policy.public_context
+                        else _select_context_engine(_agent_cfg))
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine
         # External engines own compaction policy — the host threshold (and its Codex
@@ -2145,7 +2157,13 @@ def init_agent(
     tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
 ):
     from agent.safe_worker_policy import safe_worker_enabled
+    from agent.request_security import current_policy
 
+    agent._request_security_policy = current_policy()
+    if agent._request_security_policy is not None and agent._request_security_policy.public_context:
+        skip_context_files = skip_memory = skip_background_review = True
+        load_soul_identity = True
+        prefill_messages = []
     if safe_worker_enabled():
         skip_context_files = skip_memory = skip_background_review = True
         load_soul_identity = False
