@@ -7,7 +7,8 @@ import logging
 from .meme_catalog import MemeCatalog
 from .meme_expression import ExpressionContext, ExpressionDelivery, capability_note
 from .meme_expression_state import ExpressionJournal
-from .memes import eligible, eligible_source
+from .memes import controller_for, eligible, eligible_source
+from .delivery_binding import turn_context
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,6 @@ class ExpressionEngine:
 
     def prepare(self, adapter, event, session_key, expression, extracted, ephemeral):
         """Resolve an already-selected ID to exact granted bytes, before any network I/O."""
-        from .delivery_binding import turn_context
         from gateway.platforms.base import SendResult
         ctrl, context = self.controller, getattr(event, '_qq_expression_context', None)
         if not expression.marked:
@@ -242,7 +242,6 @@ def cleanup(delivery):
 
 
 def engine_for(adapter):
-    from .memes import controller_for
     controller = controller_for(adapter)
     engine = getattr(controller, '_expression_engine', None)
     if engine is None:
