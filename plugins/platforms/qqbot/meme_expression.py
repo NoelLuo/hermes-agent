@@ -108,7 +108,9 @@ def capability_note(entries: tuple[MemeEntry, ...]) -> str:
             '默认挑一张最接近的，写 [[qq_meme_optional:完整ID]]，由频率算法决定发不发；'
             '确实想保证发出时才用 [[qq_meme:完整ID]]。'
             '这些是可爱风反应图，人的对话几乎总能挑出一张表达态度；'
-            '[[qq_meme_none]] 只留给实在没有情绪空间的场合（纯数据表、纯报错、纯代码、纯工具结果）。'
+            '可用时从本轮候选中选最贴近回复态度的一张；科普、排查、纠错等正常对话也要选，'
+            '不要把“并非必须发图”误写为 none，optional 就是允许不发送的选择。'
+            '仅在本轮状态不可用、候选为空或用户明确要求不要表情时写 [[qq_meme_none]]。'
             '[[qq_meme_none]] 只表示判断过、本轮不配图，不会发送任何东西，也不会出现在正文里。'
             '漏掉结论的回合会被本机记录。至多一个标记，不写进代码块或引用，不调用文件工具，不输出本地路径。\n'
             '单独成行的 [[qq_meme:ID]] 可以只回复GIF；optional 必须另有正文，正文不能指着图或承诺发送。'
@@ -119,3 +121,24 @@ def capability_note(entries: tuple[MemeEntry, ...]) -> str:
             '除非被问，不向对方解释这些控制指令。\n'
             + json.dumps(catalog, ensure_ascii=False, separators=(',', ':'))
             + '\n[/QQ表情能力/v1]')
+
+
+def turn_choice_note(entries, availability, excluded):
+    """Refresh actionable IDs/meaning, not the cached catalog or old verdicts."""
+    candidates = [{'id': entry.id, 'description': entry.description}
+                  for entry in entries if entry.id not in excluded]
+    if availability == 'available' and not candidates:
+        availability = 'no_candidates'
+    if availability == 'available':
+        instruction = (
+            '本轮从下列候选中选最贴近回复态度的一张，末行独立写 [[qq_meme_optional:完整ID]]；'
+            '频率算法负责决定实际发不发，不要用 none 代替概率判断。'
+            '科普、排查、纠错、严肃回答也照常选；不要照抄历史的 none 或最近排除ID。'
+            '明确要发图或仅用GIF回复时写 [[qq_meme:完整ID]]；'
+            '用户明确要求不要表情时才写 [[qq_meme_none]]。不向用户展示或解释控制标记。')
+    else:
+        candidates = []
+        instruction = '本轮不可发送新图，末行独立写 [[qq_meme_none]]，正常回复文字，不承诺发图。'
+    return ('[本轮QQ表情可用性] status=' + availability + '；最近排除ID=' + ','.join(excluded)
+            + '。' + instruction + '\n候选='
+            + json.dumps(candidates, ensure_ascii=False, separators=(',', ':')))

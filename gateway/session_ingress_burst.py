@@ -18,6 +18,7 @@ from functools import partial
 import logging
 import time
 
+from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
 from hermes_cli.observability.shared_metrics_busy import note_busy_merged, settle_busy_arrival, stamp_busy_arrival
 
@@ -36,6 +37,10 @@ class _Burst:
 
 
 def _kind(adapter, event):
+    # QQ messages each own a turn and requester policy; do not collapse even
+    # same-sender text/photos into the first event's message ID and permissions.
+    if event.source.platform == Platform.QQBOT:
+        return None
     if event.message_type == MessageType.PHOTO and not event.internal:
         return 'photo'
     return 'text' if adapter._is_queue_text_debounce_candidate(event) else None

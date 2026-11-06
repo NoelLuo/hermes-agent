@@ -5,7 +5,7 @@ import asyncio
 import logging
 
 from .meme_catalog import MemeCatalog
-from .meme_expression import ExpressionContext, ExpressionDelivery, capability_note
+from .meme_expression import ExpressionContext, ExpressionDelivery, capability_note, turn_choice_note
 from .meme_expression_state import ExpressionJournal
 from .memes import controller_for, eligible, eligible_source
 from .delivery_binding import turn_context
@@ -67,11 +67,7 @@ class ExpressionEngine:
         notes = [] if present else [note]
         availability = self.journal.availability(_chat(event), ctrl.clock(), settings)
         excluded = ctrl.state.recent(_chat(event), settings.recent)
-        notes.append('[本轮QQ表情可用性] status=' + availability
-                     + '；最近排除ID=' + ','.join(excluded)
-                     + '。本轮必须给出表情结论：末行写 [[qq_meme:ID]] 或 [[qq_meme_optional:ID]]，'
-                     '都不合适写 [[qq_meme_none]]；漏掉会被本机记录。'
-                     'status 不可用时只写 none，正常回复文字，不承诺发图。')
+        notes.append(turn_choice_note(entries, availability, excluded))
         if fact:
             notes.append(fact)
         return notes
