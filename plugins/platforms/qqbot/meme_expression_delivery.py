@@ -113,7 +113,7 @@ class ExpressionEngine:
                 or not eligible(adapter, event, plan.text or 'GIF', ephemeral, settings)):
             self._stop(delivery, 'blocked', 'ineligible')
             return
-        if plan.error or entry is None or (plan.optional and not plan.text):
+        if plan.error or entry is None:
             self._stop(delivery, 'blocked', plan.error or 'invalid_selection')
             return
         if entry.id in ctrl.state.recent(delivery.chat, settings.recent):
@@ -193,8 +193,10 @@ class ExpressionEngine:
                         daily_limit=ctrl.settings.daily_limit):
                     self._stop(delivery, 'blocked', 'already_claimed')
                     return SendResult(success=False, error='Expression not admitted')
+                # Probability controls attached decoration, never the sole reply.
+                # Both marker spellings obey the same content-based rule.
                 if not ctrl.state.choose(delivery.turn_id,
-                        'natural' if delivery.expression.optional else 'strong', ctrl.clock(),
+                        'natural' if delivery.expression.text else 'strong', ctrl.clock(),
                         probability=ctrl.settings.probability, draw=ctrl.draw):
                     self._stop(delivery, 'not_selected', 'optional_prd')
                     return None
