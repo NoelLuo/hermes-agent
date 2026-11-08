@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 _API_IMAGE_NAME = re.compile(r'api_[0-9a-f]{32}\.(png|jpg|gif|webp)')
 _SHA256_NAME = re.compile(r'[0-9a-f]{64}')
+_HISTORY_MEDIA_DIGEST = re.compile(r'[0-9a-f]{64}(?=[/\\])')
 
 
 # Retained paths a capture published or reused whose admission has not committed or been refused
@@ -514,26 +515,29 @@ def collect_unheld_api_images(db):
 
 
 def _history_mentions(conn, references, after_id=0):
-    """Candidate paths any transcript row (id > after_id) mentions raw or JSON-escaped, in ONE
-    messages pass. Rows are prefiltered in SQL on the literal text before each candidate's digest
-    directory, so only rows that could name a candidate reach Python's exact substring test."""
+    """Find raw/JSON-escaped retained paths in one pass independent of the candidate count.
+
+    Testing every digest against every message made startup collection block the gateway loop
+    for minutes. Extract content-addressed path digests once, then check only that digest's tails.
+    """
     # Matched by the content-addressed tail ``<sha256>/<name>`` with either separator, so every
     # spelling a note can carry (the host path, a sandbox backend's ``to_agent_visible_cache_path``)
     # counts as a mention.
     needles = {}
     for reference in references:
         raw = reference['path']
+        tails = needles.setdefault(reference['sha256'], {})
         for tail in (reference['sha256'] + sep + Path(raw).name for sep in ('/', '\\')):
-            needles[tail] = needles[json.dumps(tail)[1:-1]] = raw
-    prefixes = sorted({reference['sha256'] for reference in references})
-    # The digests are ONE bound JSON array, never one ``instr`` term each: the statement's size
-    # must not grow with the candidate count (SQLite's expression-depth limit fails at ~1000 terms).
-    query = ('WITH digests(value) AS MATERIALIZED (SELECT value FROM json_each(?)) SELECT content FROM messages '
-             'WHERE EXISTS (SELECT 1 FROM digests WHERE instr(content, digests.value))' + (' AND id>?' if after_id else ''))
+            tails[tail] = tails[json.dumps(tail)[1:-1]] = raw
+    if not needles:
+        return set()
+    query = 'SELECT content FROM messages WHERE id>?'
     mentioned = set()
-    for (content,) in conn.execute(query, (json.dumps(prefixes), *((after_id,) if after_id else ()))):
+    for (content,) in conn.execute(query, (after_id,)):
         text = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
-        mentioned.update(raw for needle, raw in needles.items() if needle in text)
+        for match in _HISTORY_MEDIA_DIGEST.finditer(text):
+            mentioned.update(raw for needle, raw in needles.get(match.group(), {}).items()
+                             if text.startswith(needle, match.start()))
     return mentioned
 
 
@@ -558,6 +562,10 @@ def release_unheld_media(db, references, *, retain_history=True):
         with db._read_ctx() as conn:
             conn.execute('BEGIN')  # one snapshot: the id watermark and the scan agree
             try:
+                held = _held_media_paths(conn)
+                references = [reference for reference in references if reference['path'] not in held]
+                if not references:
+                    return 0
                 last_id = conn.execute('SELECT coalesce(max(id), 0) FROM messages').fetchone()[0]
                 seen = _history_mentions(conn, references)
             finally:
