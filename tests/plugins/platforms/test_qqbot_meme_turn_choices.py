@@ -25,7 +25,8 @@ async def test_each_turn_reoffers_nonexcluded_semantics_without_mutating_history
     before = copy.deepcopy(history)
     _, notes = await prepare(adapter, make_event(adapter, identifier='next'), history)
     note, candidates = choices(notes)
-    assert candidates == [{'id': 'yes', 'description': 'affirmation'}]
+    assert candidates == [{'id': 'yes', 'description': 'affirmation',
+                           'use_when': ['agree'], 'recent_sent_count': 0}]
     assert 'status=available' in note and '[[qq_meme_optional:完整ID]]' in note
     assert not any(n.startswith('[QQ表情能力/v1]') for n in notes)
     assert history == before
@@ -65,7 +66,8 @@ async def test_second_explicit_dm_user_gets_choices_and_native_gif_not_other_use
     async with httpx.AsyncClient(transport=transport) as client:
         adapter._http_client = client
         notes, results = await emit(adapter, event, '好的。\n[[qq_meme_optional:yes]]')
-    assert choices(notes)[1] == [{'id': 'yes', 'description': 'affirmation'}]
+    assert choices(notes)[1] == [{'id': 'yes', 'description': 'affirmation',
+                                 'use_when': ['agree'], 'recent_sent_count': 0}]
     assert all(r.success for r in results)
     assert [body['msg_type'] for _, body in requests] == [2, 7]
     assert all(path == '/v2/users/second-approved-user/messages' for path, _ in requests)
