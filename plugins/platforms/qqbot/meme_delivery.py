@@ -9,13 +9,18 @@ from .memes import controller_for, eligible, mark_response
 # A connected adapter outlives discovery: pin marker types and ContextVars to
 # its own module generation, rather than importing replacements mid-turn.
 from .meme_expression import parse_expression
-from .meme_expression_delivery import engine_for
+from .meme_expression_delivery import cleanup, engine_for
 from .meme_native import snapshot, restore, bridge
+from . import voice_reply
 
 logger = logging.getLogger(__name__)
 
 
 class MemeDeliveryMixin:
+    def _wants_auto_tts(self, *args, **kwargs):
+        # The QQ text-first path owns audio when enabled, including voice inputs.
+        return not voice_reply.enabled(self) and super()._wants_auto_tts(*args, **kwargs)
+
     def snapshot_native_turn(self, event):
         return snapshot(self, event)
 
@@ -37,7 +42,7 @@ class MemeDeliveryMixin:
 
     async def deliver_queued_response(self, response, event, session_key, metadata=None, *,
                                        text_already_delivered=False, deliver_media=True):
-        if controller_for(self).settings.mode != 'expression' or not parse_expression(response).judged:
+        if not voice_reply.enabled(self) and (controller_for(self).settings.mode != 'expression' or not parse_expression(response).judged):
             return None
         if text_already_delivered:
             return True  # QQ never streams expression directives; do not replay an acknowledged final.
@@ -47,7 +52,7 @@ class MemeDeliveryMixin:
                 is_ephemeral_response=not deliver_media)
             if extracted.text_content:
                 result, _ = await self.send_final_ledgered(event, session_key, extracted.text_content,
-                    metadata, reply_to=event.message_id)
+                    metadata, reply_to=event.message_id, is_ephemeral_response=not deliver_media)
                 results.append(result)
                 if not result.success:
                     return False
@@ -66,6 +71,7 @@ class MemeDeliveryMixin:
 
     async def prepare_turn_notes(self, event, session_id, session_key, history):
         with self._media_delivery_scope(event.source):
+            voice_reply.begin_turn(self, event, session_key)
             return await engine_for(self).prepare_turn_notes(self, event, session_id, session_key, history)
 
     async def _process_message_background(self, event, session_key):
@@ -90,6 +96,7 @@ class MemeDeliveryMixin:
         extracted = await super()._extract_response_content(
             expression.text if expression else response, event, session_key, is_ephemeral_response=is_ephemeral_response)
         mark_response(event, extracted, is_ephemeral_response)
+        voice_reply.mark_response(event, extracted)
         if expression is not None and not expression.judged:
             if eligible(self, event, extracted.text_content or 'x', is_ephemeral_response,
                         controller_for(self).settings):
@@ -131,7 +138,33 @@ class MemeDeliveryMixin:
                 except Exception as exc:
                     # Decorations must never turn a successful text send into a replayable failure.
                     logger.warning('QQ optional meme unavailable: %s', type(exc).__name__)
+                # Expression GIFs normally belong to the later attachment phase.
+                # Attempt them here before synthesis; that phase will consume the
+                # cached result and remove the snapshot, not send it a second time.
+                if expression_delivery is not None:
+                    await self._send_expression(delivery_adapter, event, expression_delivery)
+                try:
+                    await voice_reply.after_text(delivery_adapter, event, session_key, text_content,
+                                                metadata, ephemeral=is_ephemeral_response)
+                except Exception:
+                    logger.warning('QQ optional voice unavailable after text', exc_info=True)
             return result, delivery_adapter
+
+    async def _send_expression(self, adapter, event, delivery):
+        from gateway.platforms.base import SendResult
+        if delivery.delivered:
+            return delivery.result
+        try:
+            with adapter._media_delivery_scope(event.source):
+                return await engine_for(adapter).deliver(adapter, event, delivery)
+        except Exception:
+            # Even an unexpected bookkeeping/scope failure must not replay text
+            # or let the later attachment phase retry an uncertain image send.
+            delivery.delivered = True
+            delivery.result = SendResult(success=False, error='Expression delivery unconfirmed')
+            cleanup(delivery)
+            logger.warning('QQ optional expression unavailable', exc_info=True)
+            return delivery.result
 
     async def _deliver_attachments(self, event, extracted, metadata, *, anything_sent, record_delivery):
         with bind_delivery(event.source.chat_id, turn_context(event, self._source_session_key(event.source))):
@@ -141,8 +174,7 @@ class MemeDeliveryMixin:
                 if snapshot:
                     extracted.media_files[:] = [p for p in extracted.media_files if p[0] != snapshot]
                 adapter = self._final_delivery_adapter(event.source)
-                with adapter._media_delivery_scope(event.source):
-                    result = await engine_for(adapter).deliver(adapter, event, delivery)
+                result = await self._send_expression(adapter, event, delivery)
                 if result is not None:
                     record_delivery(result)
                 # An expression-only final is a native attachment, not a dropped text reply.

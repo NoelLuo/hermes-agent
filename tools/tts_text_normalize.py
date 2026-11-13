@@ -15,19 +15,19 @@ import re
 # "Weather." label.
 _HEAD = "\x00"
 
-_MD_CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```")
+_MD_CODE_BLOCK_RE = re.compile(r"^[ \t]*(?P<fence>`{3,}|~{3,})[^\n]*\n(?P<code>[\s\S]*?)(?:^[ \t]*(?P=fence)[ \t]*$|\Z)", re.MULTILINE)
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((?:[^()]|\([^)]*\))*\)")
 _MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\((?:[^()]|\([^)]*\))*\)")
 _MD_INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 _MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", flags=re.DOTALL)
-_MD_UNDERSCORE_BOLD_RE = re.compile(r"__(.+?)__", flags=re.DOTALL)
-_MD_ITALIC_RE = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", flags=re.DOTALL)
-_MD_UNDERSCORE_ITALIC_RE = re.compile(r"(?<!_)_(?!_)(.+?)(?<!_)_(?!_)", flags=re.DOTALL)
+_MD_UNDERSCORE_BOLD_RE = re.compile(r"(?<!\w)__(?=\S)(.+?)(?<=\S)__(?!\w)")
+_MD_ITALIC_RE = re.compile(r"(?<!\*)\*(?!\s|\*)(.+?)(?<=\S)(?<!\*)\*(?!\*)")
+_MD_UNDERSCORE_ITALIC_RE = re.compile(r"(?<!\w)_(?!\s|_)(.+?)(?<=\S)_(?!\w)")
 _MD_STRIKE_RE = re.compile(r"~~(.+?)~~", flags=re.DOTALL)
 _MD_HEADING_LINE_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$", flags=re.MULTILINE)
-_MD_BLOCKQUOTE_RE = re.compile(r"^\s*>\s?", flags=re.MULTILINE)
-_MD_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+", flags=re.MULTILINE)
-_MD_HR_RE = re.compile(r"^\s*[-*_]{3,}\s*$", flags=re.MULTILINE)
+_MD_BLOCKQUOTE_RE = re.compile(r"^[ \t]*(?:>[ \t]?)+", flags=re.MULTILINE)
+_MD_LIST_ITEM_RE = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+(?:\[[ xX]\][ \t]+)?", flags=re.MULTILINE)
+_MD_HR_RE = re.compile(r"^[ \t]*(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$", flags=re.MULTILINE)
 _MD_TABLE_PIPE_RE = re.compile(r"\s*\|\s*")
 _URL_RE = re.compile(r"https?://\S+")
 # Local file links ("MEDIA:/Users/me/file.xlsx") are click targets on screen, not
@@ -61,7 +61,11 @@ def strip_markdown_for_tts(text: str) -> str:
     if not text:
         return ""
     text = html.unescape(str(text))
-    text = _MD_CODE_BLOCK_RE.sub(" ", text)
+    text = _MD_CODE_BLOCK_RE.sub(lambda m: m['code'], text)
+    # Consume line structure BEFORE emphasis can pair a rule/list star with prose.
+    text = _MD_BLOCKQUOTE_RE.sub("", text)
+    text = _MD_HR_RE.sub("", text)
+    text = _MD_LIST_ITEM_RE.sub("", text)
     text = _MD_IMAGE_RE.sub(lambda m: f" {m.group(1)} " if m.group(1) else " ", text)
     text = _MD_LINK_RE.sub(r"\1", text)
     text = _URL_RE.sub("", text)
@@ -77,8 +81,25 @@ def strip_markdown_for_tts(text: str) -> str:
     text = _MD_BLOCKQUOTE_RE.sub("", text)
     text = _MD_LIST_ITEM_RE.sub("", text)
     text = _MD_HR_RE.sub("", text)
-    # Leftover table pipes become pauses instead of a spoken "vertical bar".
-    return _MD_TABLE_PIPE_RE.sub("; ", text)
+    return _spoken_table_rows(text)
+
+
+def _spoken_table_rows(text: str) -> str:
+    """Only table blocks get pipe cleanup; prose/math pipes remain literal."""
+    lines = text.split('\n')
+    table = False
+    for index, line in enumerate(lines):
+        cells = line.strip().strip('|').split('|')
+        delimiter = '|' in line and all(re.fullmatch(r'[ \t]*:?-{3,}:?[ \t]*', c) for c in cells)
+        if delimiter and index and '|' in lines[index - 1]:
+            lines[index - 1] = _MD_TABLE_PIPE_RE.sub('; ', lines[index - 1].strip().strip('|')).strip()
+            lines[index] = ''
+            table = True
+        elif table and '|' in line:
+            lines[index] = _MD_TABLE_PIPE_RE.sub('; ', line.strip().strip('|')).strip()
+        else:
+            table = False
+    return '\n'.join(lines)
 
 
 def _normalize_temperature_ranges(text: str) -> str:
@@ -223,7 +244,7 @@ def smooth_whitespace_for_tts(text: str) -> str:
                 # token after it (file link, code fence) is already gone from
                 # speech, so the voice would hang on the open pause. Close it.
                 line = line.rstrip(":;").rstrip() + "."
-            elif line[-1] not in ".!?":
+            elif line.rstrip('\"\'”’）)]')[-1:] not in ".!?。！？…":
                 line += "."
         lines.append(line)
     flush_pending()
@@ -251,13 +272,14 @@ _THINK_BLOCK_OPEN_RE = re.compile(r"<think[\s>].*\Z", flags=re.DOTALL | re.IGNOR
 # run_agent.py's turn-end file-mutation verifier footer (a ``⚠️ File-mutation verifier:``
 # header line plus indented ``•`` bullets) is a UI affordance, not speech.
 _VERIFIER_FOOTER_RE = re.compile(r"^\s*⚠️?\s*File-mutation verifier:.*(?:\n[ \t]+•.*)*", flags=re.MULTILINE)
+_CONTROL_TOKEN_RE = re.compile(r"\[\[(?:audio_as_voice|qq_meme_none|qq_meme(?:_optional)?:[^\]\r\n]+)\]\]")
 
 
 def strip_nonspoken_blocks(text: str) -> str:
     """Remove ``<think>`` reasoning blocks and the file-mutation verifier footer."""
     if not text:
         return ""
-    for pattern in (_THINK_BLOCK_RE, _THINK_BLOCK_OPEN_RE, _VERIFIER_FOOTER_RE):
+    for pattern in (_THINK_BLOCK_RE, _THINK_BLOCK_OPEN_RE, _VERIFIER_FOOTER_RE, _CONTROL_TOKEN_RE):
         text = pattern.sub(" ", text)
     return text
 
@@ -271,7 +293,7 @@ def flatten_newlines_for_payload(text: str) -> str:
     """
     if not text:
         return ""
-    for pattern, repl in ((r"\n{2,}", ". "), (r"(?<=[.!?;:,])\n", " "), (r"\n", ". "), (r"\.\s*\.", "."),
+    for pattern, repl in ((r"([.!?;:,。！？；：，…][\"'”’）)\]]*)\n+", r"\1 "), (r"\n+", ". "), (r"\.\s*\.", "."),
                           (r"[ \t]{2,}", " ")):
         text = re.sub(pattern, repl, text)
     # Single-line text ("Here is the list:") skips the per-line pause pass, so close a
@@ -285,11 +307,26 @@ def prepare_spoken_text(text: str, max_chars: int | None = 4000) -> str:
     Pipeline: non-spoken blocks > Markdown > symbols/units > identifier-dense tokens >
     line formatting into sentence pauses > single line (for newline-sensitive providers),
     then ``max_chars``."""
-    spoken = text
-    for step in (strip_nonspoken_blocks, strip_markdown_for_tts, normalize_symbols_for_tts,
-                 prune_identifier_tokens_for_tts,
-                 smooth_whitespace_for_tts, flatten_newlines_for_payload):
+    spoken = _MEDIA_PATH_RE.sub(' ', strip_nonspoken_blocks(text))
+    # Literal code is content, not formatting. Shield it from emphasis, symbol and
+    # identifier passes; restore before whitespace smoothing, without the fences.
+    literals: dict[str, str] = {}
+    prefix = '\x01CODE'
+    while prefix in spoken:
+        prefix += 'X'
+
+    def hold(value: str) -> str:
+        key = f'{prefix}{len(literals)}\x02'
+        literals[key] = value
+        return key
+
+    spoken = _MD_CODE_BLOCK_RE.sub(lambda m: hold(m['code'].strip('\n')), spoken)
+    spoken = _MD_INLINE_CODE_RE.sub(lambda m: hold(m[1]), spoken)
+    for step in (strip_markdown_for_tts, normalize_symbols_for_tts, prune_identifier_tokens_for_tts):
         spoken = step(spoken)
+    for key, value in literals.items():
+        spoken = spoken.replace(key, value)
+    spoken = flatten_newlines_for_payload(smooth_whitespace_for_tts(spoken))
     if max_chars is not None and max_chars > 0 and len(spoken) > max_chars:
         spoken = spoken[:max_chars].rstrip()
     return spoken

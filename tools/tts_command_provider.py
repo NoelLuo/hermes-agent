@@ -6,7 +6,7 @@ context, ``{{``/``}}`` stay literal. Owns the quote-aware rendering, the idle-ti
 process runner and the generic ``<section>.providers.<name>`` readers, re-imported by
 ``tts_tool``/``transcription_tools`` under their historical private names. TTS placeholders:
 ``{input_path}``/``{text_path}``, ``{output_path}``, ``{format}``, ``{voice}``, ``{model}``,
-``{speed}``. Built-in provider names always win over a same-named ``providers`` entry.
+``{speed}``, ``{language}``. Built-in provider names always win over a same-named ``providers`` entry.
 """
 
 from __future__ import annotations
@@ -358,6 +358,7 @@ def _generate_command_tts(
             "input_path": str(text_path), "text_path": str(text_path), "output_path": str(output),
             "format": _get_command_tts_output_format(config, str(output)),
             "voice": str(config.get("voice", "")), "model": str(config.get("model", "")),
+            "language": str(config.get("language", "auto")),
             "speed": str(config.get("speed", tts_config.get("speed", ""))),
         }
         command = render_command_template(command_template, placeholders)

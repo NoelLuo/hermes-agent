@@ -258,6 +258,11 @@ def _finalize_voice_delivery(
         return file_str, native and want_opus and file_str.endswith(".ogg")
     if not opted_in:
         return file_str, False
+    if (not want_opus and command_provider_config is not None
+            and command_provider_config.get("preserve_source_audio") is True):
+        # Destination adapters may require their own codec (e.g. SILK). Avoid a
+        # lossy intermediate Opus encode when the operator opts into native delivery.
+        return file_str, True
     # Plugin-registered provider (issue #30398). Voice-bubble delivery opts in via
     # ``TTSProvider.voice_compatible`` (mirrors the command-provider opt-in). Plugins that already write
     # Opus skip the ffmpeg conversion.
@@ -502,7 +507,8 @@ def _synthesize_chunks(chunks: list[str], base_path: Path, generated_artifacts: 
 def text_to_speech_tool(
     text: str, output_path: Optional[str] = None, speed: Optional[float] = None,
     instructions: Optional[str] = None, provider: Optional[str] = None,
-    voice_id: Optional[str] = None, find_voices: Optional[dict[str, Any]] = None) -> str:
+    voice_id: Optional[str] = None, find_voices: Optional[dict[str, Any]] = None,
+    language: Optional[str] = None) -> str:
     """Convert text to speech with long-form chunking; returns the JSON result envelope.
 
     Text is normalized, split into provider-safe chunks (never silently truncated), synthesized
@@ -517,11 +523,20 @@ def text_to_speech_tool(
         from tools.tts_text_normalize import prepare_spoken_text
         text = prepare_spoken_text(text, max_chars=None)
     except Exception:
-        text = text.strip()
+        return tool_error("TTS text cleanup failed; refusing to speak raw markup", success=False)
     if not text:
         return tool_error("Text is empty after TTS cleanup", success=False)
     tts_config, provider = _apply_call_overrides(_load_tts_config(), speed, provider)
-    tts_config, error = _apply_voice_override(tts_config, provider, voice_id)
+    command_provider_config = _resolve_command_provider_config(provider, tts_config)
+    if command_provider_config is not None:
+        from tools.tts_command_options import apply_options
+        try:
+            tts_config = apply_options(tts_config, provider, command_provider_config, voice_id, language)
+        except ValueError as exc:
+            return tool_error(str(exc), success=False)
+        error = None
+    else:
+        tts_config, error = _apply_voice_override(tts_config, provider, voice_id)
     if error:
         return error
     command_provider_config = _resolve_command_provider_config(provider, tts_config)
@@ -687,6 +702,14 @@ def _tts_schema_overrides() -> dict:
     would name the launch profile's home for everyone else (#95685)."""
     params = copy.deepcopy(TTS_SCHEMA["parameters"])
     params["properties"]["output_path"]["description"] = _output_path_description(display_hermes_home())
+    config = _load_tts_config()
+    command = _resolve_command_provider_config(_get_provider(config), config)
+    if command is not None:
+        from tools.tts_command_options import schema_options
+        params["properties"].update(schema_options(command))
+        return {"parameters": params, "description": TTS_SCHEMA["description"].replace(
+            _CONFIGURED_VOICE_SENTENCE,
+            "The provider is user-configured; select only configured voice_id and language options per call.")}
     if not elevenlabs_voice_selection_active():
         return {"parameters": params}
     from tools.tts_elevenlabs_voices import FIND_VOICES_SCHEMA
@@ -741,7 +764,7 @@ registry.register(
     schema=TTS_SCHEMA,
     handler=lambda args, **kw: text_to_speech_tool(
         text=args.get("text", ""),
-        **{k: args.get(k) for k in ("output_path", "speed", "instructions", "voice_id", "find_voices")}),
+        **{k: args.get(k) for k in ("output_path", "speed", "instructions", "voice_id", "find_voices", "language")}),
     check_fn=check_tts_requirements,
     emoji="🔊",
     dynamic_schema_overrides=_tts_schema_overrides)

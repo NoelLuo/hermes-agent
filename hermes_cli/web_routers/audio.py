@@ -49,6 +49,9 @@ _AUDIO_MIME_EXTENSIONS: dict[str, str] = {
 }
 
 _MAX_TRANSCRIPTION_UPLOAD_BYTES = 25 * 1024 * 1024
+# Keep the data-URL allocation within the core's default audio delivery budget,
+# even if a provider/profile opts into larger files for other surfaces.
+_MAX_SPEAK_AUDIO_BYTES = 10 * 1024 * 1024
 
 _SPEAK_MIME_BY_EXT = {
     ".mp3": "audio/mpeg", ".ogg": "audio/ogg", ".opus": "audio/ogg", ".wav": "audio/wav",
@@ -307,9 +310,15 @@ async def speak_text(payload: TTSSpeakRequest, profile: Optional[str] = None):
     # _config_profile_scope raises 400/404 for a bad profile — pass it
     # through instead of masking it as a 500 synthesis failure.
     with http_failure("Desktop voice TTS failed", 500, "Speech synthesis failed"):
-        from tools.tts_tool import text_to_speech_tool
+        return await _run_config_scoped(profile, lambda: _speak_data_url(text))
 
-        result_json = await _run_config_scoped(profile, lambda: text_to_speech_tool(text))
+
+def _speak_data_url(text: str) -> dict:
+    # Synthesis and cleanup belong to ONE worker: cancelling the awaiting HTTP
+    # task cannot strand a file created later by an in-flight sync provider.
+    from tools.tts_tool import text_to_speech_tool
+
+    result_json = text_to_speech_tool(text)
 
     try:
         result = json.loads(result_json) if isinstance(result_json, str) else result_json
@@ -326,21 +335,24 @@ async def speak_text(payload: TTSSpeakRequest, profile: Optional[str] = None):
         raise HTTPException(status_code=500, detail="Audio file missing")
 
     mime_type = _SPEAK_MIME_BY_EXT.get(os.path.splitext(file_path)[1].lower(), "audio/mpeg")
-
-    def _read_and_unlink() -> bytes:
-        # Off-loop: synthesized audio can be several MB; reading it inline
-        # blocks the uvicorn event loop. Unlink rides the same thread hop so
-        # the temp file cannot outlive an early return.
-        try:
-            with open(file_path, "rb") as fh:
-                return fh.read()
-        finally:
-            _unlink_quietly(file_path)
+    file_paths = result.get("file_paths") or [file_path]
 
     try:
-        audio_bytes = await asyncio.to_thread(_read_and_unlink)
+        if len(file_paths) != 1:
+            # Core can retain separate files when joining fails or exceeds its
+            # delivery cap. A single data URL must never play only the first.
+            raise HTTPException(status_code=413, detail="Complete audio could not fit in one playback file")
+        if os.path.getsize(file_path) > _MAX_SPEAK_AUDIO_BYTES:
+            raise HTTPException(status_code=413, detail="Synthesized audio exceeds playback size limit")
+        with open(file_path, "rb") as fh:
+            audio_bytes = fh.read(_MAX_SPEAK_AUDIO_BYTES + 1)
+        if len(audio_bytes) > _MAX_SPEAK_AUDIO_BYTES:
+            raise HTTPException(status_code=413, detail="Synthesized audio exceeds playback size limit")
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Could not read audio: {exc}")
+    finally:
+        for path in set(file_paths) | {file_path}:
+            _unlink_quietly(path)
 
     encoded = base64.b64encode(audio_bytes).decode("ascii")
     return {
@@ -614,8 +626,9 @@ async def speak_stream_ws(ws: WebSocket) -> None:
       server → ``{"type": "start", "sample_rate": N, "channels": 1}`` (sent
                with the first PCM frame, once the provider's rate is final),
                binary PCM frames, then ``{"type": "end"}``
-      server → ``{"type": "fallback"}`` only when sentence synthesis produced
-               no audio. Providers with no chunked API (edge, the default)
+      server → ``{"type": "fallback"}`` for command providers (complete-response
+               POST playback), or when sentence synthesis produced no audio.
+               Other providers with no chunked API (edge, the default)
                still speak per sentence via ``text_to_speech_tool`` and stream
                that PCM — the client POST is the last resort, not the Edge path.
     """
@@ -640,17 +653,27 @@ async def speak_stream_ws(ws: WebSocket) -> None:
     def _resolve():
         from tools.tts_streaming import resolve_streaming_provider
         from tools.tts_tool import _get_provider, _load_tts_config, _resolve_max_text_length
+        from tools.tts_command_provider import _resolve_command_provider_config
         with grant_home_scope(grant), _config_profile_scope(profile):
             cfg = _load_tts_config()
             streamer = resolve_streaming_provider(cfg)
             cap = _resolve_max_text_length(_get_provider(cfg), cfg)
-        return streamer, cap, cfg
+            command = _resolve_command_provider_config(_get_provider(cfg), cfg) is not None
+        return streamer, cap, cfg, command
 
     try:
-        streamer, cap, cfg = await asyncio.to_thread(_resolve)
+        streamer, cap, cfg, command = await asyncio.to_thread(_resolve)
     except Exception:
         _log.exception("speak-stream provider resolution failed")
-        streamer, cap, cfg = None, 0, {}
+        streamer, cap, cfg, command = None, 0, {}, False
+    if streamer is None and command:
+        # Command engines (e.g. GPT-SoVITS) cannot overlap PCM delivery with
+        # inference. Reuse Desktop's complete-text POST path: the core tool
+        # finishes and joins ALL provider-sized chunks before playback starts.
+        # Native streamers and Edge retain their low-latency sentence path.
+        await ws.send_json({"type": "fallback"})
+        await ws.close()
+        return
     if streamer is None:
         # Edge (the default) and every other non-chunked provider still have a
         # documented per-sentence path. type=fallback here is what makes Desktop

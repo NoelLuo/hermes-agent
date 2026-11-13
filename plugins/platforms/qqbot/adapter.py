@@ -1884,7 +1884,8 @@ class QQAdapter(MemeDeliveryMixin, OwnAccessPolicyMixin, BasePlatformAdapter):
         return await self._send_media(chat_id, image_path, MEDIA_TYPE_IMAGE, "image", caption, reply_to)
 
     async def send_voice(self, chat_id, audio_path, caption=None, reply_to=None, **kwargs) -> SendResult:
-        return await self._send_media(chat_id, audio_path, MEDIA_TYPE_VOICE, "voice", caption, reply_to)
+        from .voice_codec import send_native_voice
+        return await send_native_voice(self, chat_id, audio_path, caption, reply_to)
 
     async def send_video(self, chat_id, video_path, caption=None, reply_to=None, **kwargs) -> SendResult:
         return await self._send_media(chat_id, video_path, MEDIA_TYPE_VIDEO, "video", caption, reply_to)

@@ -351,7 +351,7 @@ def _concat_audio_files(audio_paths: list[str], output_path: str, *, voice_compa
         concat_path.write_text(entries, encoding="utf-8")
         args = ["-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(concat_path), "-vn"]
         suffix = destination.suffix.lower()
-        if voice_compatible or suffix in {".ogg", ".opus"}:
+        if suffix in {".ogg", ".opus"}:
             args += ["-c:a", "libopus", "-ac", "1", "-b:a", "64k", "-vbr", "off"]
         elif suffix == ".mp3" and all(Path(path).suffix.lower() == ".mp3" for path in audio_paths):
             args += ["-c:a", "copy"]

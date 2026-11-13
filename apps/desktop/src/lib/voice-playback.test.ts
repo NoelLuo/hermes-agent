@@ -7,6 +7,7 @@ import type * as SharedTypes from '@hermes/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $voicePlayback } from '@/store/voice-playback'
+import { speakText } from '@/hermes'
 
 import { playSpeechText, startSpeechStream, stopVoicePlayback } from './voice-playback'
 
@@ -241,6 +242,19 @@ describe('voice-playback teardown (#91991)', () => {
     // disturb anything that started since.
     await vi.runOnlyPendingTimersAsync()
 
+    expect($voicePlayback.get().status).toBe('idle')
+  })
+
+  it('discards a late synthesis response after typing barge-in, before creating audio', async () => {
+    let complete!: (value: Awaited<ReturnType<typeof speakText>>) => void
+    vi.mocked(speakText).mockImplementationOnce(() => new Promise(resolve => { complete = resolve }))
+    const playback = playSpeechText('Still synthesizing.', { source: 'read-aloud', syncOnly: true })
+    await vi.advanceTimersByTimeAsync(0)
+    expect($voicePlayback.get().status).toBe('preparing')
+    stopVoicePlayback()
+    complete({ ok: true, data_url: 'data:audio/wav;base64,AAAA', mime_type: 'audio/wav' })
+    await expect(playback).resolves.toBe(false)
+    expect(FakeAudio.instances).toHaveLength(0)
     expect($voicePlayback.get().status).toBe('idle')
   })
 

@@ -4,7 +4,7 @@ const FENCED_CODE_RE = /```[\s\S]*?(?:```|$)/g
 const INLINE_CODE_RE = /`([^`]+)`/g
 const MARKDOWN_LINK_RE = /\[([^\]]+)\]\(([^)]+)\)/g
 const PARAGRAPH_BREAK_RE = /[ \t]*\n{2,}[ \t]*/g
-const PUNCTUATED_PARAGRAPH_BREAK_RE = /([.!?])([*_~`>"'’”)}\]]*)[ \t]*\n{2,}[ \t]*/g
+const PUNCTUATED_PARAGRAPH_BREAK_RE = /([.!?。！？…])([*_~`>"'’”)}\]]*)[ \t]*\n{2,}[ \t]*/g
 const SOFT_BREAK_RE = /[ \t]*\n[ \t]*/g
 
 // A file-link token ("MEDIA:/path/to/report.xlsx") renders as a chip on
@@ -326,7 +326,16 @@ export function sanitizeTextForSpeech(text: string): string {
   // Close line-final colons BEFORE newlines are flattened: "the regex list:"
   // followed by a code block keeps its colon if this runs after the flatten,
   // and the voice hangs on it. Closing early turns it into "the regex list.".
-  const pre = withoutTables.replace(LINE_FINAL_COLON_RE, '.')
+  // Structural markers only make sense while line boundaries still exist.
+  // Flattening first stranded '- ' inside the payload, where the backend
+  // could no longer recognize it as a list (and CJK paragraphs gained '。.').
+  const pre = withoutTables
+    .replace(/\[\[(?:audio_as_voice|qq_meme_none|qq_meme(?:_optional)?:[^\]\r\n]+)\]\]/g, '')
+    .replace(/^[ \t]*(?:>[ \t]?)+/gm, '')
+    .replace(/^[ \t]*(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$/gm, '')
+    .replace(/^[ \t]*(?:[-+*]|\d+[.)])[ \t]+(?:\[[ xX]\][ \t]+)?/gm, '')
+    .replace(/^[ \t]{0,3}#{1,6}[ \t]+/gm, '')
+    .replace(LINE_FINAL_COLON_RE, '.')
 
   // Unspeakable tokens are silence, never a placeholder word: an English
   // "code block omitted" / "link" is wrong for every non-English voice.
