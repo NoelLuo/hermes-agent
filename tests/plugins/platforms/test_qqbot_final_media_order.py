@@ -12,7 +12,14 @@ from gateway.request_security import policy_for_adapter
 from gateway.run_adapter_turns import finish_adapter_followup
 from plugins.platforms.qqbot.memes import controller_for
 from tests.plugins.platforms.test_qqbot_memes import bot, make_event
-from tests.plugins.platforms.test_qqbot_meme_expression import emit, prepare
+from tests.plugins.platforms.test_qqbot_meme_expression import emit as emit_expression, prepare
+from tests.plugins.platforms.test_qqbot_voice_reply import drain_voice
+
+
+async def emit(bot, event, text):
+    result = await emit_expression(bot, event, text)
+    await drain_voice(bot)
+    return result
 
 
 @pytest.fixture
@@ -68,6 +75,7 @@ async def test_text_meme_then_synthesis_and_voice(ordered, mode, lane):
                 result = await finish_adapter_followup(runner, {'final_response': text},
                     event, event.source, key, {})
                 assert result['already_sent'] and result['media_already_delivered']
+            await drain_voice(bot)
     assert events == ['text', 'meme-upload', 'meme', 'tts', 'voice-upload', 'voice']
     assert current_policy() is None
 

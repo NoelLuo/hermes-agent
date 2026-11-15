@@ -17,6 +17,17 @@ logger = logging.getLogger(__name__)
 
 
 class MemeDeliveryMixin:
+    async def handle_message(self, event):
+        voice_reply.receive_input(self, event)
+        await super().handle_message(event)
+
+    async def cancel_background_tasks(self):
+        await voice_reply.shutdown(self)
+        await super().cancel_background_tasks()
+
+    async def _stop_optional_voice(self):
+        await voice_reply.shutdown(self)
+
     def _wants_auto_tts(self, *args, **kwargs):
         # The QQ text-first path owns audio when enabled, including voice inputs.
         return not voice_reply.enabled(self) and super()._wants_auto_tts(*args, **kwargs)
@@ -144,8 +155,8 @@ class MemeDeliveryMixin:
                 if expression_delivery is not None:
                     await self._send_expression(delivery_adapter, event, expression_delivery)
                 try:
-                    await voice_reply.after_text(delivery_adapter, event, session_key, text_content,
-                                                metadata, ephemeral=is_ephemeral_response)
+                    voice_reply.schedule(delivery_adapter, event, session_key, text_content,
+                                         metadata, ephemeral=is_ephemeral_response)
                 except Exception:
                     logger.warning('QQ optional voice unavailable after text', exc_info=True)
             return result, delivery_adapter

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
-from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, nullcontext
+from contextvars import copy_context
 import hashlib
 import json
 import logging
@@ -23,7 +25,12 @@ _AUDIO = {'.wav', '.mp3', '.ogg', '.opus', '.silk', '.amr', '.m4a', '.flac'}
 # Eviction fails closed for an old pending reply, never makes it current again.
 _CURRENT_TURNS = OrderedDict()
 _STARTED_TURNS = OrderedDict()
+_INPUT_LANES = set()
 _ACTIVE_SENDS = {}
+_ACTIVE_REPLIES = {}
+# Optional slow providers must not exhaust asyncio's shared executor (admission,
+# database and ordinary tools use it too). Cancelled queued work never starts.
+_SYNTHESIS_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix='qq-auto-tts')
 
 
 def _turn_key(adapter, session_key):
@@ -31,8 +38,8 @@ def _turn_key(adapter, session_key):
             getattr(adapter, '_owner_profile', None) or 'default', session_key)
 
 
-def begin_turn(adapter, event, session_key):
-    """Called by the execution preparation hook, not receipt/admission of an input."""
+def begin_turn(adapter, event, session_key, *, incoming=False):
+    """Fallback for restored turns; an older queued turn cannot undo newer intake."""
     turn = getattr(event, '_qq_meme_turn', None)
     if (not _matches(turn, event) or event.internal or event.inherit_channel_pin
             or session_key != adapter._source_session_key(event.source)):
@@ -46,25 +53,108 @@ def begin_turn(adapter, event, session_key):
     if identity in _STARTED_TURNS:
         turn._voice_generation = _STARTED_TURNS[identity]
         return
-    # The execution hook is authoritative; retain its durable token when present.
+    # Live intake registers first. Recovery without intake uses the execution hook.
     # A fresh object prevents an old in-flight generation reviving after eviction.
     generation = (getattr(event, '_gateway_active_turn_token', None) or event.message_id, object())
     turn._voice_generation = generation
+    if not incoming and key in _INPUT_LANES:
+        # Unknown restored executions cannot supersede a known live input.
+        return
     _STARTED_TURNS[identity] = generation
+    if incoming:
+        _INPUT_LANES.add(key)
     _CURRENT_TURNS[key] = generation
     _CURRENT_TURNS.move_to_end(key)
+    for task, (message_id, _) in tuple(_ACTIVE_REPLIES.get(key, {}).items()):
+        if message_id != event.message_id:
+            task.cancel()
     # Stop an awaited codec/upload before it can post the old message. A POST
     # already submitted to QQ remains unknown, never recalled or retried.
     for task, message_id in tuple(_ACTIVE_SENDS.get(key, {}).items()):
         if message_id != event.message_id:
             task.cancel()
     while len(_CURRENT_TURNS) > 2048:
-        _CURRENT_TURNS.popitem(last=False)
+        expired, _ = _CURRENT_TURNS.popitem(last=False)
+        _INPUT_LANES.discard(expired)
     while len(_STARTED_TURNS) > 4096:
         _STARTED_TURNS.popitem(last=False)
 
 
+def receive_input(adapter, event):
+    """Notify before admission can wait, after canonical route and authorization checks."""
+    from gateway.request_security import policy_for_adapter
+    from gateway.platforms.base import coerce_plaintext_gateway_command
+    if (not _matches(getattr(event, '_qq_meme_turn', None), event)
+            or event.internal or event.inherit_channel_pin):
+        return
+    if not adapter._message_handler or adapter._drop_unresolved(event):
+        return
+    if event.allow_gateway_control:
+        coerce_plaintext_gateway_command(event)
+    source = event.source
+    if adapter._is_sender_authorized(source.user_id, source.chat_type, source.chat_id,
+                                     thread_id=source.thread_id) is not True:
+        return
+    policy = policy_for_adapter(adapter, source)
+    command = event.get_command()
+    if policy is not None and command and not policy.allows_command(command):
+        return
+    key = adapter._source_session_key(source)
+    expected = str((event.metadata or {}).get('gateway_session_key') or '').strip()
+    if expected and expected != key:
+        return
+    begin_turn(adapter, event, key, incoming=True)
+
+
+def schedule(adapter, event, session_key, text, metadata=None, *, ephemeral=False):
+    """The text ACK owns completion. Track optional audio outside the reply lane."""
+    if not _eligible(adapter, event, text, ephemeral, metadata) or not _is_current(adapter, event, session_key):
+        return
+    key = _turn_key(adapter, session_key)
+    active = _ACTIVE_REPLIES.setdefault(key, {})
+    if any(message_id == event.message_id for message_id, _ in active.values()):
+        return
+    tasks = getattr(adapter, '_qq_voice_tasks', None)
+    if tasks is None:
+        tasks = adapter._qq_voice_tasks = set()
+
+    async def deliver():
+        from .delivery_binding import bind_delivery, turn_context
+        # Re-enter the captured source's scope even after the foreground turn ends.
+        with adapter._media_delivery_scope(event.source), bind_delivery(
+                event.source.chat_id, turn_context(event, session_key)):
+            await after_text(adapter, event, session_key, text, metadata, ephemeral=ephemeral)
+
+    task = asyncio.create_task(deliver(), name='qq-optional-voice')
+    tasks.add(task)
+    active[task] = (event.message_id, adapter)
+
+    def done(completed):
+        tasks.discard(completed)
+        active.pop(completed, None)
+        if not active and _ACTIVE_REPLIES.get(key) is active:
+            _ACTIVE_REPLIES.pop(key, None)
+        if not completed.cancelled() and completed.exception() is not None:
+            logger.warning('QQ optional voice task failed: %s', type(completed.exception()).__name__)
+
+    task.add_done_callback(done)
+
+
+async def shutdown(adapter):
+    """Cancel optional delivery before this transport's HTTP client is closed."""
+    adapter._qq_voice_stopping = True
+    tasks = tuple(getattr(adapter, '_qq_voice_tasks', ()))
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        _, pending = await asyncio.wait(tasks, timeout=5)
+        if pending:
+            logger.warning('QQ optional voice shutdown: %d tasks still unwinding', len(pending))
+
+
 def _is_current(adapter, event, session_key):
+    if getattr(adapter, '_qq_voice_stopping', False):
+        return False
     turn = getattr(event, '_qq_meme_turn', None)
     generation = getattr(turn, '_voice_generation', None)
     key = _turn_key(adapter, session_key)
@@ -305,8 +395,16 @@ async def after_text(adapter, event, session_key, text, metadata=None, *, epheme
                 logger.info('QQ optional voice started event=%s', trace)
                 if not _is_current(adapter, event, session_key):
                     return
-                paths = await asyncio.to_thread(job.run,
-                    lambda: _is_current(adapter, event, session_key), text, policy, *_limits(adapter))
+                # Media-only scope intentionally has no provider secrets. Hydrate
+                # the captured source's runtime scope for this background synthesis.
+                runner = getattr(adapter, 'gateway_runner', None)
+                scope = (runner._async_profile_scope_for_source(source)
+                         if runner is not None else nullcontext())
+                async with scope:
+                    context = copy_context()
+                    paths = await asyncio.get_running_loop().run_in_executor(
+                        _SYNTHESIS_EXECUTOR, context.run, job.run,
+                        lambda: _is_current(adapter, event, session_key), text, policy, *_limits(adapter))
                 if not _is_current(adapter, event, session_key):
                     job.discard()
                     return

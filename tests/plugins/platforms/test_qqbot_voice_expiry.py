@@ -1,4 +1,4 @@
-"""Automatic audio expires at execution start, not at an unrelated input arrival."""
+"""Automatic audio expiry, scoped delivery and late provider cleanup."""
 import asyncio
 import json
 from pathlib import Path
@@ -22,11 +22,27 @@ async def start(bot, event):
     return key
 
 
+def track_provider_cleanup(monkeypatch):
+    from plugins.platforms.qqbot import voice_reply
+    finished = threading.Event()
+    original = voice_reply._SynthesisJob.run
+
+    def run(job, *args):
+        try:
+            return original(job, *args)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(voice_reply._SynthesisJob, 'run', run)
+    return finished
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('next_turn', ['same', 'other', 'arrived_only'])
 @pytest.mark.parametrize('provider_failure', [False, True])
 async def test_new_execution_expires_old_audio_but_other_session_or_arrival_does_not(
         bot, wire, monkeypatch, next_turn, provider_failure):
+    finished = track_provider_cleanup(monkeypatch)
     loop = asyncio.get_running_loop()
     started = asyncio.Event()
     release = threading.Event()
@@ -64,6 +80,7 @@ async def test_new_execution_expires_old_audio_but_other_session_or_arrival_does
         finally:
             release.set()
         result, _ = await asyncio.wait_for(task, 10)
+        await async_wait_until(finished.is_set, timeout=10, what='late synthesis cleanup')
     assert result.success
     stale = next_turn == 'same'
     assert len(calls) == (1 if stale else 2)
@@ -92,6 +109,7 @@ async def test_already_stale_final_never_starts_synthesis(bot, wire, monkeypatch
 
 @pytest.mark.asyncio
 async def test_new_turn_audio_is_not_deleted_when_old_provider_finishes(bot, wire, monkeypatch):
+    finished = track_provider_cleanup(monkeypatch)
     loop = asyncio.get_running_loop()
     started = asyncio.Event()
     release = threading.Event()
@@ -119,6 +137,8 @@ async def test_new_turn_audio_is_not_deleted_when_old_provider_finishes(bot, wir
         finally:
             release.set()
         await asyncio.wait_for(old, 10)
+        await async_wait_until(finished.is_set, timeout=10, what='old synthesis completion')
+        await async_wait_until(lambda: 'A' in files and not files['A'].exists(), timeout=10, what='old audio cleanup')
     assert not files['A'].exists() and files['B'].exists()
     assert files['A'].parent != files['B'].parent
     assert [body['msg_type'] for _, body in calls] == [2, 2, 7]
@@ -338,6 +358,7 @@ async def test_real_fifo_starts_next_turn_while_previous_tts_waits(monkeypatch):
             assert not release.is_set()
             release.set()
             await async_wait_until(lambda: not adapter._background_tasks, timeout=15, what='FIFO audio completion')
+            await async_wait_until(lambda: files and not files[0].exists(), timeout=15, what='stale audio cleanup')
         finally:
             release.set()
             tasks = list(adapter._background_tasks) + [live.task for live in authority.sessions.values() if live.task]

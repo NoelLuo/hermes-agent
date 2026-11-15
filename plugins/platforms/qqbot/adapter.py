@@ -237,6 +237,7 @@ class QQAdapter(MemeDeliveryMixin, OwnAccessPolicyMixin, BasePlatformAdapter):
             await self._open_gateway_ws(log_url=True)
             self._listen_task = asyncio.create_task(self._listen_loop())
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            self._qq_voice_stopping = False
             self._mark_connected()
             logger.info("[%s] Connected", self._log_tag)
             self._wire_plugin_handlers(None)
@@ -270,6 +271,7 @@ class QQAdapter(MemeDeliveryMixin, OwnAccessPolicyMixin, BasePlatformAdapter):
 
     async def _cleanup(self) -> None:
         """Close WebSocket, HTTP session, and client; fail pending futures."""
+        await self._stop_optional_voice()
         await self._close_ws()
         if self._http_client:
             await self._http_client.aclose()

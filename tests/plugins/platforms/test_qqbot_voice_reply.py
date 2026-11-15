@@ -63,11 +63,18 @@ def tts(monkeypatch, tmp_path):
     return calls
 
 
+async def drain_voice(bot):
+    # Tests asserting audio await the separate task, never the production reply lane.
+    await asyncio.gather(*getattr(bot, '_qq_voice_tasks', ()), return_exceptions=True)
+
+
 async def final(bot, event, text='**你好**，这是回复。', *, ephemeral=False, metadata=None):
     key = bot._source_session_key(event.source)
     extracted = await bot._extract_response_content(text, event, key, is_ephemeral_response=ephemeral)
-    return await bot.send_final_ledgered(event, key, extracted.text_content, metadata or {},
+    result = await bot.send_final_ledgered(event, key, extracted.text_content, metadata or {},
         reply_to=event.message_id, is_ephemeral_response=ephemeral)
+    await drain_voice(bot)
+    return result
 
 
 @pytest.mark.asyncio
@@ -223,9 +230,11 @@ async def test_normal_queued_first_and_followup_use_same_hook(bot, wire, tts):
         bot._http_client = client
         handled = await runner._deliver_queued_first_response('排队第一条', event.source, bot,
             session_key=key, inbound_event=event)
+        await drain_voice(bot)
         followup = event_for(bot, 'input-followup')
         result = await finish_adapter_followup(runner, {'final_response': '后续一条'},
             followup, followup.source, key, {})
+        await drain_voice(bot)
     assert handled and result['already_sent'] and result['media_already_delivered']
     assert [body['msg_type'] for _, body in calls] == [2, 7, 2, 7]
     assert len(tts) == 2
